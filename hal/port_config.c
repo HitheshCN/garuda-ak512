@@ -1,0 +1,386 @@
+/**
+ * @file port_config.c
+ *
+ * @brief GPIO pin initialization for Project Garuda ESC.
+ * Adapted from AN1292 reference:
+ *   - Keeps: PWM outputs, LEDs, buttons, UART PPS, PCI8 fault
+ *   - Removes: Op-amp configuration for OA1/OA2 (not used)
+ *   - Adds: Phase voltage ADC pins (RB9, RB8, RA10), DShot IC1 pin (RD8)
+ *   - Adds: OA3 bus current sensing (when FEATURE_HW_OVERCURRENT enabled)
+ *
+ * Definitions in this file are for dsPIC33AK128MC106
+ *
+ * Component: PORTS
+ */
+
+#include <xc.h>
+
+#include "port_config.h"
+#include "../garuda_config.h"
+
+/**
+ * @brief Initialize all ports as input/digital, then map hardware functions.
+ */
+void SetupGPIOPorts(void)
+{
+    /* Reset all PORTx register (all inputs) */
+
+    #ifdef TRISA
+        TRISA = 0xFFFF;
+        LATA  = 0x0000;
+    #endif
+    #ifdef ANSELA
+        ANSELA = 0x0000;
+    #endif
+
+    #ifdef TRISB
+        TRISB = 0xFFFF;
+        LATB  = 0x0000;
+    #endif
+    #ifdef ANSELB
+        ANSELB = 0x0000;
+    #endif
+
+    #ifdef TRISC
+        TRISC = 0xFFFF;
+        LATC  = 0x0000;
+    #endif
+    #ifdef ANSELC
+        ANSELC = 0x0000;
+    #endif
+
+    #ifdef TRISD
+        TRISD = 0xFFFF;
+        LATD  = 0x0000;
+    #endif
+    #ifdef ANSELD
+        ANSELD = 0x0000;
+    #endif
+
+    /* MC510 (AK512 target) adds ports E/F/G — guarded so the AK128 build
+     * (no TRISE/F/G) is byte-identical. Mirrors AN957 port_config.c. */
+    #ifdef TRISE
+        TRISE = 0xFFFF;
+        LATE  = 0x0000;
+    #endif
+    #ifdef ANSELE
+        ANSELE = 0x0000;
+    #endif
+
+    #ifdef TRISF
+        TRISF = 0xFFFF;
+        LATF  = 0x0000;
+    #endif
+    #ifdef ANSELF
+        ANSELF = 0x0000;
+    #endif
+
+    #ifdef TRISG
+        TRISG = 0xFFFF;
+        LATG  = 0x0000;
+    #endif
+    #ifdef ANSELG
+        ANSELG = 0x0000;
+    #endif
+
+    MapGPIOHWFunction();
+}
+
+/**
+ * @brief Map port pins as input/output, analog/digital, and PPS assignments.
+ */
+void MapGPIOHWFunction(void)
+{
+#if FEATURE_FOC || FEATURE_FOC_V2 || FEATURE_FOC_V3 || FEATURE_FOC_AN1078
+    /* ================================================================
+     * Phase Current Sensing via OA1/OA2 (Internal Op-Amps) — FOC modes
+     * OA1IN+ : RA4  (DIM:013), OA1IN- : RA3  (DIM:015)
+     * OA1OUT : RA2  (DIM:017) → AD1AN0 (Ia)
+     * OA2IN+ : RB2  (DIM:021), OA2IN- : RB1  (DIM:023)
+     * OA2OUT : RB0  (DIM:025) → AD2AN1 (Ib)
+     * From reference: port_config.c:126-145
+     * ================================================================ */
+#if GARUDA_TARGET_AK512
+    /* MC510: identical OA1/OA2 pins (OA1IN+ RA4, OA1IN- RA3, OA1OUT RA2,
+     * OA2IN+ RB2, OA2IN- RB1, OA2OUT RB0). AN957 internal-op-amp mode
+     * drives the OUT pins with TRIS=0 — mirror that convention here. */
+    ANSELAbits.ANSELA4 = 1; TRISAbits.TRISA4 = 1;   /* OA1IN+ */
+    ANSELAbits.ANSELA3 = 1; TRISAbits.TRISA3 = 1;   /* OA1IN- */
+    ANSELAbits.ANSELA2 = 1; TRISAbits.TRISA2 = 0;   /* OA1OUT (AN957: TRIS=0, op-amp drives pin) */
+    ANSELBbits.ANSELB2 = 1; TRISBbits.TRISB2 = 1;   /* OA2IN+ */
+    ANSELBbits.ANSELB1 = 1; TRISBbits.TRISB1 = 1;   /* OA2IN- */
+    ANSELBbits.ANSELB0 = 1; TRISBbits.TRISB0 = 0;   /* OA2OUT (AN957: TRIS=0, op-amp drives pin) */
+#else
+    ANSELAbits.ANSELA4 = 1; TRISAbits.TRISA4 = 1;   /* OA1IN+ */
+    ANSELAbits.ANSELA3 = 1; TRISAbits.TRISA3 = 1;   /* OA1IN- */
+    ANSELAbits.ANSELA2 = 1; TRISAbits.TRISA2 = 1;   /* OA1OUT (TRIS=1: disable digital output, let OA drive) */
+    ANSELBbits.ANSELB2 = 1; TRISBbits.TRISB2 = 1;   /* OA2IN+ */
+    ANSELBbits.ANSELB1 = 1; TRISBbits.TRISB1 = 1;   /* OA2IN- */
+    ANSELBbits.ANSELB0 = 1; TRISBbits.TRISB0 = 1;   /* OA2OUT (TRIS=1: disable digital output, let OA drive) */
+#endif /* GARUDA_TARGET_AK512 */
+#else
+#if GARUDA_TARGET_AK512
+    /* 6-step diagnostic phase-current monitor: same OA1/OA2 pins on MC510.
+     * AN957 convention: op-amp OUT pins TRIS=0 (internal op-amp mode). */
+    ANSELAbits.ANSELA4 = 1; TRISAbits.TRISA4 = 1;   /* OA1IN+ */
+    ANSELAbits.ANSELA3 = 1; TRISAbits.TRISA3 = 1;   /* OA1IN- */
+    ANSELAbits.ANSELA2 = 1; TRISAbits.TRISA2 = 0;   /* OA1OUT */
+    ANSELBbits.ANSELB2 = 1; TRISBbits.TRISB2 = 1;   /* OA2IN+ */
+    ANSELBbits.ANSELB1 = 1; TRISBbits.TRISB1 = 1;   /* OA2IN- */
+    ANSELBbits.ANSELB0 = 1; TRISBbits.TRISB0 = 0;   /* OA2OUT */
+
+    /* ================================================================
+     * Phase Voltage Feedback (MCLV-48V-300W via MC510 DIM, per AN957)
+     * M1_VA : DIM:009 - RA9  (AD1AN3)
+     * M1_VB : DIM:011 - RA10 (AD1AN4)
+     * M1_VC : DIM:022 - RB8  (AD2AN4)
+     * ================================================================ */
+    ANSELAbits.ANSELA9 = 1;
+    TRISAbits.TRISA9 = 1;
+
+    ANSELAbits.ANSELA10 = 1;
+    TRISAbits.TRISA10 = 1;
+
+    ANSELBbits.ANSELB8 = 1;
+    TRISBbits.TRISB8 = 1;
+#else
+    /* 6-step diagnostic phase-current monitor: reuse same OA1/OA2 pins.
+     * CMP1/CMP2 share RA4/RB2 but are init'd with DACEN=0 (disabled), so
+     * the comparators don't claim the pins — safe to drive as OA inputs. */
+    ANSELAbits.ANSELA4 = 1; TRISAbits.TRISA4 = 1;   /* OA1IN+ */
+    ANSELAbits.ANSELA3 = 1; TRISAbits.TRISA3 = 1;   /* OA1IN- */
+    ANSELAbits.ANSELA2 = 1; TRISAbits.TRISA2 = 1;   /* OA1OUT */
+    ANSELBbits.ANSELB2 = 1; TRISBbits.TRISB2 = 1;   /* OA2IN+ */
+    ANSELBbits.ANSELB1 = 1; TRISBbits.TRISB1 = 1;   /* OA2IN- */
+    ANSELBbits.ANSELB0 = 1; TRISBbits.TRISB0 = 1;   /* OA2OUT */
+
+    /* Original 6-step block (phase voltage feedback) continues below. */
+    /* ================================================================
+     * Phase Voltage Feedback (MCLV-48V-300W via EV68M17A DIM)
+     * M1_VA : DIM:009 - RB9  (AD2AN10)
+     * M1_VB : DIM:011 - RB8  (AD1AN11)
+     * M1_VC : DIM:022 - RA10 (AD2AN7)
+     * ================================================================ */
+    ANSELBbits.ANSELB9 = 1;
+    TRISBbits.TRISB9 = 1;
+
+    ANSELBbits.ANSELB8 = 1;
+    TRISBbits.TRISB8 = 1;
+
+    ANSELAbits.ANSELA10 = 1;
+    TRISAbits.TRISA10 = 1;
+#endif /* GARUDA_TARGET_AK512 */
+#endif
+
+#if GARUDA_TARGET_AK512
+    /* ================================================================
+     * Potentiometer input (POT1) - used as Speed Reference
+     * DIM:028 - PIN #36: AD2AN5/CVDAN31/CVDTX15/RP32/RB15 (AN957)
+     * ================================================================ */
+    ANSELBbits.ANSELB15 = 1;
+    TRISBbits.TRISB15 = 1;
+
+    /* ================================================================
+     * DC Bus Voltage (VBUS)
+     * DIM:039 - PIN #37: AD3AN4/CVDTX29/RP81/RF0 (AN957)
+     * ================================================================ */
+    ANSELFbits.ANSELF0 = 1;
+    TRISFbits.TRISF0 = 1;
+#else
+    /* ================================================================
+     * Potentiometer input (POT1) - used as Speed Reference
+     * DIM:028 - PIN #06: AD1AN10/RP12/RA11
+     * ================================================================ */
+    ANSELAbits.ANSELA11 = 1;
+    TRISAbits.TRISA11 = 1;
+
+    /* ================================================================
+     * DC Bus Voltage (VBUS)
+     * DIM:039 - PIN #02: AD1AN6/RP8/IOMF1/RA7
+     * ================================================================ */
+    ANSELAbits.ANSELA7 = 1;
+    TRISAbits.TRISA7 = 1;
+#endif /* GARUDA_TARGET_AK512 */
+
+    /* ================================================================
+     * Inverter Control - PWM Outputs
+     * PWM1L : DIM:003 - PIN #54  TDI/RP52/PWM1L/IOMD5/RD3
+     * PWM1H : DIM:001 - PIN #53  TDO/RP51/PWM1H/IOMD4/RD2
+     * PWM2L : DIM:007 - PIN #52  TCK/RP50/PWM2L/IOMD3/RD1
+     * PWM2H : DIM:005 - PIN #51  RP49/PWM2H/IOMD2/RD0
+     * PWM3L : DIM:004 - PIN #44  RP37/PWM3L/IOMD1/RC4
+     * PWM3H : DIM:002 - PIN #43  PGD3/RP36/PWM3H/IOMD0/RC3
+     * ================================================================ */
+    TRISDbits.TRISD3 = 0;
+    TRISDbits.TRISD2 = 0;
+    TRISDbits.TRISD1 = 0;
+    TRISDbits.TRISD0 = 0;
+    TRISCbits.TRISC4 = 0;
+    TRISCbits.TRISC3 = 0;
+
+#if GARUDA_TARGET_AK512
+    /* ================================================================
+     * Debug LEDs (AN957 map for the MC510 DIM)
+     * LED1 : DIM:030 - PIN #10 : CVDTX21/RP67/RE2
+     * LED2 : DIM:032 - PIN #06 : CVDTX22/RP68/RE3
+     * ================================================================ */
+    TRISEbits.TRISE2 = 0;
+    TRISEbits.TRISE3 = 0;
+
+    /* ================================================================
+     * Push button Switches (AN957 map for the MC510 DIM)
+     * SW1 : DIM:034 - PIN #03 : CVDAN12/RP13/RA12
+     * SW2 : DIM:036 - PIN #02 : CVDTX20/RP66/RE1
+     * ================================================================ */
+    TRISAbits.TRISA12 = 1;
+    TRISEbits.TRISE1 = 1;
+#else
+    /* ================================================================
+     * Debug LEDs
+     * LED1 : DIM:030 - PIN #55 : RP54/ASCL1/RD5
+     * LED2 : DIM:032 - PIN #34 : RP42/IOMD10/SDO2/IOMF10/PCI19/RC9
+     * ================================================================ */
+    TRISDbits.TRISD5 = 0;
+    TRISCbits.TRISC9 = 0;
+
+    /* ================================================================
+     * Push button Switches
+     * SW1 : DIM:034 - PIN #49 : RP58/IOMF7/RD9
+     * SW2 : DIM:036 - PIN #50 : RP59/RD10
+     * ================================================================ */
+    TRISDbits.TRISD9 = 1;
+    TRISDbits.TRISD10 = 1;
+#endif /* GARUDA_TARGET_AK512 */
+
+    /* ================================================================
+     * PWM Fault PCI8 input — board OC+OV fault (M1_FAULT_OC_OV)
+     * DIM:040 - Pin #32 : RP28/SDI2/RB11
+     * TRISB11 = 1 (input) from TRISB=0xFFFF init above.
+     * ANSELB11 = 0 (digital) from ANSELB=0x0000 init above.
+     * ================================================================ */
+#if GARUDA_TARGET_AK512
+    /* MC510 DIM: fault is still DIM:040 -> device pin 1, CVDTX19/RP65/RE0
+     * (matches AN957 for this board). TRIS/ANSEL handled by port init. */
+    _PCI8R = 65;
+#else
+    _PCI8R = 28;
+#endif
+
+#if GARUDA_TARGET_AK512
+    /* ================================================================
+     * UART PPS mapping (AN957: _U1RXR = 47, _RP48R = 19)
+     * UART_RX : DIM:054 - PIN #74 : RP47/APWM3H/IOMBD9/RC14 (Input)
+     * UART_TX : DIM:052 - PIN #75 : RP48/APWM3L/IOMBD8/RC15 (Output)
+     * U1TX output-function code on MC510 is 19 (vs 9 on the 106).
+     * ================================================================ */
+    _U1RXR = 47;
+    _RP48R = 19;
+
+    /* ================================================================
+     * RX Input Pin — same DIM position as the 106 build (DIM:108).
+     * MC510 DIM:108 = device PIN #17 : CVDAN15/RP16/RA15.
+     * PPS mapping (_ICM4R) lives in hal_input_capture.c:HAL_IC4_Init().
+     * ================================================================ */
+    TRISAbits.TRISA15 = 1;     /* Input */
+#else
+    /* ================================================================
+     * UART PPS mapping
+     * UART_RX : DIM:054 - PIN #46 : RP44/IOMD8/IOMF8/RC11 (Input)
+     * UART_TX : DIM:052 - PIN #45 : RP43/IOMD9/IOMF9/RC10 (Output)
+     * ================================================================ */
+    _U1RXR = 44;
+    _RP43R = 9;
+
+    /* ================================================================
+     * RX Input Pin (RD8 = RP57)
+     * PPS mapping moved to hal_input_capture.c:HAL_IC4_Init() (Phase H).
+     * TRIS input config stays here (GPIO direction is port_config's job).
+     * ================================================================ */
+    TRISDbits.TRISD8 = 1;      /* Input */
+#endif /* GARUDA_TARGET_AK512 */
+
+#if FEATURE_HW_OVERCURRENT
+    /* ================================================================
+     * Bus Current Sensing via OA3 (Internal Op-Amp)
+     * OA3IN+ : DIM:029 - RB5  (M1_SHUNT_IBUS_P)
+     * OA3IN- : DIM:031 - RA6  (M1_SHUNT_IBUS_N)
+     * OA3OUT : RA5 → CMP3A (analog comparator) + AD1AN3 (ADC readback)
+     * TRISA5=0 correct for internal op-amp output mode (reference line 157).
+     * CMP3A and AD1AN3 read the internal analog bus regardless of TRIS.
+     * ================================================================ */
+    ANSELBbits.ANSELB5 = 1;  TRISBbits.TRISB5 = 1;   /* OA3IN+ = RB5 */
+    ANSELAbits.ANSELA6 = 1;  TRISAbits.TRISA6 = 1;    /* OA3IN- = RA6 */
+    ANSELAbits.ANSELA5 = 1;  TRISAbits.TRISA5 = 0;    /* OA3OUT = RA5 (output) */
+#endif
+}
+
+/**
+ * @brief Initialize OA1/OA2 internal op-amps for phase current sensing.
+ * External gain resistors on MCLV-48V-300W provide gain.
+ * OA1OUT (RA2) → AD1AN0 (Ia), OA2OUT (RB0) → AD2AN1 (Ib).
+ * Used by FOC (primary current feedback) and 6-step (diagnostic monitor).
+ * Adapted from reference OpampConfig() lines 235-283.
+ */
+void HAL_OA12_Init(void)
+{
+    /* OMONEN=0 (2026-06-10): the datasheet REQUIRES at most ONE op-amp with
+     * the output-monitor enabled ("should be set high only for one instance
+     * at a time") — all three were set, a shared-internal-bus violation that
+     * matches the unstable/railed op-amp readings (OA1~4085, OA2~60, OA3
+     * wandering 70↔4090 between runs, even with the bridge OFF — bogus OC_SW
+     * trips at rest). Not needed anyway: all three outputs are bonded to
+     * physical pins and read as plain ANx inputs (AD1AN0/AD2AN1/AD1AN3);
+     * CMP3 reads the OA3OUT pin via CMP3A (INSEL=0). */
+    AMP1CON1 = 0x0000;
+    AMP1CON1bits.HPEN = 1;     /* High-power mode (high bandwidth) */
+    AMP1CON1bits.UGE = 0;      /* External resistor gain (not unity) */
+    AMP1CON1bits.DIFFCON = 0;  /* Both differential pairs active */
+#if GARUDA_TARGET_AK512
+    /* MC510: AMPxCON1 has NO OMONEN field (no output-monitor enable in the
+     * p33AK512MC510.h header — fields are REFEN/DIFFCON/UGE/HPEN/AMPEN).
+     * TODO P1b: verify MC510 op-amp output readback path without OMONEN. */
+
+    AMP2CON1 = 0x0000;
+    AMP2CON1bits.HPEN = 1;
+    AMP2CON1bits.UGE = 0;
+    AMP2CON1bits.DIFFCON = 0;
+#else
+    AMP1CON1bits.OMONEN = 1;   /* RESTORED 2026-06-10: OMONEN=0 experiment made the
+                                * bus readout WORSE (wandering rails at rest) — this
+                                * board has run OMONEN=1 on all three for weeks. The
+                                * datasheet one-instance note does not match observed
+                                * behavior here; readout may route via the monitor. */
+
+    AMP2CON1 = 0x0000;
+    AMP2CON1bits.HPEN = 1;
+    AMP2CON1bits.UGE = 0;
+    AMP2CON1bits.DIFFCON = 0;
+    AMP2CON1bits.OMONEN = 1;
+#endif
+
+    AMP1CON1bits.AMPEN = 1;    /* Enable OA1 — begins settling (~10us) */
+    AMP2CON1bits.AMPEN = 1;    /* Enable OA2 */
+}
+
+#if FEATURE_HW_OVERCURRENT
+/**
+ * @brief Initialize OA3 internal op-amp for bus current sensing.
+ * External gain resistors on MCLV-48V-300W provide gain = 24.95.
+ * OA3OUT (RA5) feeds CMP3A for hardware overcurrent and AD1AN3 for readback.
+ * Adapted from reference OpampConfig() lines 285-322.
+ */
+void HAL_OA3_Init(void)
+{
+    AMP3CON1 = 0x0000;
+    AMP3CON1bits.HPEN = 1;       /* High-power mode (high bandwidth) */
+    AMP3CON1bits.UGE = 0;        /* External resistor gain (not unity) */
+    AMP3CON1bits.DIFFCON = 0;    /* Both differential pairs active */
+#if GARUDA_TARGET_AK512
+    /* MC510: no OMONEN field on AMP3CON1 — see HAL_OA12_Init note.
+     * TODO P1b: verify MC510 op-amp output readback path without OMONEN. */
+#else
+    AMP3CON1bits.OMONEN = 1;     /* restored — see HAL_OA12_Init note */
+#endif
+    AMP3CON1bits.AMPEN = 1;      /* Enable op-amp — begins settling (~10us) */
+}
+#endif

@@ -1,0 +1,112 @@
+/**
+ * @file commutation.c
+ *
+ * @brief 6-step commutation table and step advance logic.
+ *
+ * Standard BLDC 6-step commutation sequence:
+ *   Step 0: A=PWM,  B=LOW,   C=FLOAT  (A->B, sense C rising)
+ *   Step 1: A=FLOAT, B=LOW,  C=PWM    (C->B, sense A falling)
+ *   Step 2: A=LOW,   B=FLOAT, C=PWM   (C->A, sense B rising)
+ *   Step 3: A=LOW,   B=PWM,  C=FLOAT  (B->A, sense C falling)
+ *   Step 4: A=FLOAT, B=PWM,  C=LOW    (B->C, sense A rising)
+ *   Step 5: A=PWM,   B=FLOAT, C=LOW   (A->C, sense B falling)
+ *
+ * Component: COMMUTATION
+ */
+
+#include "commutation.h"
+#include "../hal/hal_pwm.h"
+#include "../hal/hal_adc.h"
+
+#if FEATURE_LEARN_MODULES
+#include "../learn/ring_buffer.h"
+#include "../learn/learn_service.h"
+#include <string.h>
+#endif
+
+/* 6-step commutation table */
+const COMMUTATION_STEP_T commutationTable[6] =
+{
+    /* Step 0: A=PWM, B=LOW, C=FLOAT — floating=C, ZC rising */
+    { PHASE_PWM_ACTIVE, PHASE_LOW,        PHASE_FLOAT,      2, +1 },
+    /* Step 1: A=FLOAT, B=LOW, C=PWM — floating=A, ZC falling */
+    { PHASE_FLOAT,      PHASE_LOW,        PHASE_PWM_ACTIVE, 0, -1 },
+    /* Step 2: A=LOW, B=FLOAT, C=PWM — floating=B, ZC rising */
+    { PHASE_LOW,        PHASE_FLOAT,      PHASE_PWM_ACTIVE, 1, +1 },
+    /* Step 3: A=LOW, B=PWM, C=FLOAT — floating=C, ZC falling */
+    { PHASE_LOW,        PHASE_PWM_ACTIVE, PHASE_FLOAT,      2, -1 },
+    /* Step 4: A=FLOAT, B=PWM, C=LOW — floating=A, ZC rising */
+    { PHASE_FLOAT,      PHASE_PWM_ACTIVE, PHASE_LOW,        0, +1 },
+    /* Step 5: A=PWM, B=FLOAT, C=LOW — floating=B, ZC falling */
+    { PHASE_PWM_ACTIVE, PHASE_FLOAT,      PHASE_LOW,        1, -1 },
+};
+
+/**
+ * @brief Advance to the next commutation step.
+ * direction=0 (CW):  0→1→2→3→4→5→0
+ * direction=1 (CCW): 0→5→4→3→2→1→0
+ * Updates PWM override registers and selects the BEMF ADC channel
+ * for the new floating phase.
+ */
+void COMMUTATION_AdvanceStep(volatile GARUDA_DATA_T *pData)
+{
+#if FEATURE_LEARN_MODULES
+    /* Build telemetry sample from the COMPLETED step (before advancing) */
+    {
+        TELEM_SAMPLE_T sample;
+        sample.timestamp = pData->systemTick;
+        sample.step = pData->currentStep;
+        sample.zcPolarity = commutationTable[pData->currentStep].zcPolarity;
+        sample.zcLatencyTicks = 0;  /* Phase 2: fill from ZC timing */
+        sample.duty = (uint16_t)pData->duty;
+        sample.vbusRaw = pData->vbusRaw;
+        sample.faultFlags = 0;      /* Phase 2: set from BEMF detection */
+        RingBuffer_Write(&telemRing, &sample);
+    }
+#endif
+
+    if (pData->direction == 0)
+    {
+        /* Forward: 0→1→2→3→4→5→0 */
+        pData->currentStep++;
+        if (pData->currentStep >= 6)
+            pData->currentStep = 0;
+    }
+    else
+    {
+        /* Reverse: 0→5→4→3→2→1→0 */
+        if (pData->currentStep == 0)
+            pData->currentStep = 5;
+        else
+            pData->currentStep--;
+    }
+
+    /* Apply the new commutation pattern */
+    COMMUTATION_ApplyStep(pData, pData->currentStep);
+}
+
+/**
+ * @brief Apply a specific commutation step (PWM overrides + ADC mux + settle).
+ * Use this whenever a non-incremental step change is needed (e.g. sine→trap
+ * transition). AdvanceStep calls this internally after incrementing the step.
+ *
+ * @param pData  Pointer to ESC runtime data
+ * @param step   Commutation step index (0-5)
+ */
+void COMMUTATION_ApplyStep(volatile GARUDA_DATA_T *pData, uint8_t step)
+{
+    if (step >= 6) step %= 6;
+
+    pData->currentStep = step;
+    HAL_PWM_SetCommutationStep(step);
+
+    bool muxChanged = HAL_ADC_SelectBEMFChannel(
+        commutationTable[step].floatingPhase);
+
+#if FEATURE_BEMF_CLOSED_LOOP
+    if (muxChanged)
+        pData->bemf.ad2SettleCount = ZC_AD2_SETTLE_SAMPLES;
+#else
+    (void)muxChanged;
+#endif
+}

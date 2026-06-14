@@ -1,0 +1,135 @@
+/**
+ * @file hal_pwm.h
+ *
+ * @brief PWM module definitions and interface for 6-step BLDC commutation.
+ * Adapted from AN1292 reference — changed to 24kHz, added override control
+ * for 6-step commutation, removed SVM/single-shunt logic.
+ *
+ * Definitions in this file are for dsPIC33AK128MC106
+ *
+ * Component: PWM
+ */
+
+#ifndef _HAL_PWM_H
+#define _HAL_PWM_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include <xc.h>
+#include <stdint.h>
+
+#include "clock.h"
+#include "../garuda_calc_params.h"
+
+/* Duty cycle register macros */
+#define PWM_PDC1                    PG1DCbits.DC
+#define PWM_PDC2                    PG2DCbits.DC
+#define PWM_PDC3                    PG3DCbits.DC
+
+#define PWM_PHASE1                  PG1PHASEbits.PHASE
+#define PWM_PHASE2                  PG2PHASEbits.PHASE
+#define PWM_PHASE3                  PG3PHASEbits.PHASE
+
+#define PWM_TRIGA                   PG1TRIGAbits.TRIGA
+
+/* PWM Fault PCI — board-level OC+OV fault via DIM040/RP28/RB11.
+ * MCLV-48V-300W has external comparators (U25A OV, U25B OC) combined
+ * through AND gate U27 into M1_FAULT_OC_OV → DIM:040 → RP28.
+ * PCI8R=28 mapped in port_config.c. PSS=0b01000 (RPn). PPS=1 (active-low).
+ *
+ * DISABLED in FOC mode: board U25B has no LEB. SVM switches all 3 phases
+ * simultaneously → ringing on bus shunt false-trips U25B → board fault
+ * latches → FPCI kills outputs. FOC disables FPCI acceptance via
+ * qualifier gating (ACP=1 edge + AQSS=LEB + LEB=0 → never qualifies).
+ * Software OC via ADC ibusRaw protects in FOC mode instead. */
+#if !FEATURE_FOC && !FEATURE_FOC_V2
+#define ENABLE_PWM_FAULT_PCI
+#endif
+#if GARUDA_TARGET_AK512
+#define PCI_FAULT_ACTIVE_STATUS     PG1STATbits.FLT1ACT
+#else
+#define PCI_FAULT_ACTIVE_STATUS     PG1STATbits.FLTACT
+#endif
+#define _PWMInterrupt               _PWM1Interrupt
+#define ClearPWMIF()                _PWM1IF = 0
+#define EnablePWMIF()               _PWM1IE = 1
+#define DisablePWMIF()              _PWM1IE = 0
+
+#if FEATURE_HW_OVERCURRENT
+/* CLEVT = Current Limit Event flag (W1C latch, bit 13 = 0x2000).
+ * Set by hardware when CLPCI transitions to active. Independent of CLIEN.
+ * Read via bitfield (safe for reads). Clear via direct register write
+ * PGnSTAT = PCI_CLIMIT_EVT_MASK to avoid RMW on other W1C bits. */
+#define PCI_CLIMIT_EVT_PG1    PG1STATbits.CLEVT
+#define PCI_CLIMIT_EVT_PG2    PG2STATbits.CLEVT
+#define PCI_CLIMIT_EVT_PG3    PG3STATbits.CLEVT
+#if GARUDA_TARGET_AK512
+#define PCI_CLIMIT_EVT_MASK   0x00020000UL   /* CLEVT = bit17 on MC510 */
+#else
+#define PCI_CLIMIT_EVT_MASK   0x2000u
+#endif
+#endif
+
+/* FLTEVT = Fault PCI Event flag (W1C latch, bit 14 = 0x4000).
+ * Set by hardware when FPCI transitions to active (even transiently).
+ * With TERM=1 (auto-terminate), FLTACT clears before ISR runs —
+ * but FLTEVT latches the event. Poll in ADC ISR to detect transient
+ * board-level FPCI trips that auto-release within one PWM cycle. */
+#if GARUDA_TARGET_AK512
+#define PCI_FAULT_EVT_PG1     PG1STATbits.FLT1EVT
+#define PCI_FAULT_EVT_PG2     PG2STATbits.FLT1EVT
+#define PCI_FAULT_EVT_PG3     PG3STATbits.FLT1EVT
+#else
+#define PCI_FAULT_EVT_PG1     PG1STATbits.FLTEVT
+#define PCI_FAULT_EVT_PG2     PG2STATbits.FLTEVT
+#define PCI_FAULT_EVT_PG3     PG3STATbits.FLTEVT
+#endif
+#if GARUDA_TARGET_AK512
+#define PCI_FAULT_EVT_MASK    0x00040000UL   /* FLT1EVT = bit18 on MC510 */
+#else
+#define PCI_FAULT_EVT_MASK    0x4000u
+#endif
+
+void InitPWMGenerators(void);
+void InitPWMGenerator1(void);
+void InitPWMGenerator2(void);
+void InitPWMGenerator3(void);
+void InitDutyPWM123Generators(void);
+void ChargeBootstrapCapacitors(void);
+
+/* 6-step commutation interface */
+void HAL_PWM_SetCommutationStep(uint8_t step);
+void HAL_PWM_SetDutyCycle(uint32_t duty);
+
+#if FEATURE_IBUS_PROBE
+/* Move the PG1TRIGA ADC sample from freewheel-center to mid-ON (period center)
+ * so AD3CH1 (IBUS) reads the true DC-link current during PWM-ON. Dev probe. */
+void HAL_PWM_IbusProbeOnCenter(void);
+#endif
+
+#if FEATURE_CL_DIFF_IDLE
+/* Differential-low CL drive mode flag (hal_pwm.c). 1 = LOW phase complementary
+ * at MIN_DUTY, effective volts = duty − base. Service code owns the swaps;
+ * cleared on HAL_MC1PWMDisableOutputs / STARTUP_Init. */
+extern volatile uint8_t g_pwmDiffLow;
+#endif
+
+#if (FEATURE_SINE_STARTUP || FEATURE_FOC || FEATURE_FOC_V2 || FEATURE_FOC_V3 || FEATURE_FOC_AN1078)
+void HAL_PWM_SetDutyCycle3Phase(uint32_t dutyA, uint32_t dutyB, uint32_t dutyC);
+void HAL_PWM_ReleaseAllOverrides(void);
+#endif
+#if FEATURE_FOC || FEATURE_FOC_V2 || FEATURE_FOC_V3 || FEATURE_FOC_AN1078
+void HAL_PWM_SetDutyFloat3Phase(float da, float db, float dc);
+#endif
+#if FEATURE_SINE_STARTUP
+void HAL_PWM_ReleaseFloatPhase(uint8_t step);
+void HAL_PWM_FloatPhaseToHiZ(uint8_t step);
+#endif
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* _HAL_PWM_H */

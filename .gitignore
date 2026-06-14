@@ -1,0 +1,13 @@
+# MPLAB X build artifacts
+**/build/
+**/dist/
+**/debug/
+**/.generated_files/
+**/nbproject/private/
+**/nbproject/Package/
+*.o
+*.d
+*.elf
+*.cof
+*.map
+funclist

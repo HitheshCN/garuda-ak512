@@ -1,0 +1,378 @@
+/**
+ * @file main.c
+ *
+ * @brief Project Garuda ESC firmware entry point.
+ *
+ * Initialization sequence:
+ *   1. InitOscillator() — 200MHz system clock, 400MHz PWM, 100MHz ADC
+ *   2. SetupGPIOPorts() — PWM, BEMF, LED, button, UART, DShot pins
+ *   3. HAL_InitPeripherals() — ADC, PWM, Timer1
+ *   4. (GSP) GSP_ParamsInitDefaults + LoadFromConfig + RecomputeDerived
+ *   5. GARUDA_ServiceInit() — state machine data, enable ADC ISR
+ *   6. Main loop — button polling, GSP intents, heartbeat, board service
+ *
+ * Component: MAIN
+ */
+
+#include <xc.h>
+#include <stdint.h>
+#include <stdbool.h>
+
+#include "garuda_types.h"
+#include "garuda_config.h"
+#include "garuda_service.h"
+#include "hal/clock.h"
+#include "hal/port_config.h"
+#include "hal/board_service.h"
+#include "hal/hal_pwm.h"
+#include "motor/startup.h"
+#include "motor/commutation.h"
+#if FEATURE_ADC_CMP_ZC
+#include "motor/hwzc.h"
+#endif
+
+#if FEATURE_LEARN_MODULES
+#include "learn/learn_service.h"
+#endif
+
+#include "x2cscope/diagnostics.h"
+#if FEATURE_GSP
+#include "gsp/gsp.h"
+#include "gsp/gsp_params.h"
+#endif
+#if FEATURE_EEPROM_V2
+#include "hal/eeprom.h"
+#endif
+#if FEATURE_COMMISSION
+#include "learn/commission.h"
+#endif
+#if FEATURE_ADAPTATION
+#include "learn/adaptation.h"
+#endif
+#if (FEATURE_RX_PWM || FEATURE_RX_DSHOT || FEATURE_RX_AUTO)
+#include "input/rx_decode.h"
+#include "hal/hal_input_capture.h"
+#endif
+#if FEATURE_BURST_SCOPE
+#include "scope/scope_burst.h"
+#endif
+
+#define GSP_HEARTBEAT_TIMEOUT_MS 500
+
+int main(void)
+{
+    /* Initialize oscillator / PLL */
+    InitOscillator();
+
+    /* Configure GPIO pins */
+    SetupGPIOPorts();
+
+    /* Initialize all peripherals */
+    HAL_InitPeripherals();
+
+    /* Initialize board service (buttons, counters) */
+    BoardServiceInit();
+
+    /* GSP runtime params — BEFORE GARUDA_ServiceInit so RT_* reads are valid
+     * from the first ISR tick. */
+#if FEATURE_GSP
+    GSP_ParamsInitDefaults();       /* compile-time defaults */
+#if FEATURE_EEPROM_V2
+#if FEATURE_PARAMS_FORCE_DEFAULTS
+    /* Bring-up: code values always win — skip the EEPROM overlay entirely so
+     * edits to profileDefaults[]/.h take effect on reflash without an NVM reset.
+     * Save path still compiles; nothing is loaded. */
+#else
+    {
+        EEPROM_IMAGE_T eepromImage;
+        EEPROM_Init(&eepromImage);
+        GARUDA_CONFIG_T cfg;
+        EEPROM_LoadConfig(&cfg);
+        GSP_ParamsLoadFromConfig(&cfg);  /* overlay persisted values */
+    }
+#endif
+#endif
+    GSP_RecomputeDerived();         /* precompute ISR values */
+#endif
+
+    /* Initialize ESC state machine and enable ADC interrupt */
+    GARUDA_ServiceInit();
+
+#if FEATURE_BURST_SCOPE
+    Scope_Init();
+#endif
+
+    /* Initialize RX input capture (Phase H) */
+#if (FEATURE_RX_PWM || FEATURE_RX_DSHOT || FEATURE_RX_AUTO)
+    RX_Init();
+#endif
+
+    /* Initialize UART1-based diagnostics (mutually exclusive) */
+#ifdef ENABLE_DIAGNOSTICS
+    DiagnosticsInit();
+#endif
+#if FEATURE_GSP
+    GSP_Init();
+#endif
+
+    /* Main loop — all real work happens in ISRs */
+    while (1)
+    {
+        /* --- CPU-load diagnostic (main-loop only, zero hot-ISR cost) ---
+         * Count loop spins; once per second compare the spin rate to the
+         * highest rate seen while the motor is NOT commutating (idle
+         * baseline). load‰ = 1000·(1 - rate/baseline). Rises as ISR + GSP
+         * work steals cycles from this loop. Relative to the motor-off
+         * baseline, so it answers "how much bandwidth is running the motor
+         * eating", not an absolute kernel %. */
+        static uint32_t cpuSpins = 0, cpuLastSpins = 0, cpuLastTick = 0;
+        static uint32_t cpuBaselineRate = 1;  /* spins/ms, !=0 to avoid div0 */
+        cpuSpins++;
+        {
+            uint32_t nowTick = garudaData.systemTick;
+            uint32_t dt = nowTick - cpuLastTick;
+            if (dt >= 1000u)            /* ~1 s window */
+            {
+                uint32_t rate = (cpuSpins - cpuLastSpins) / dt;   /* spins/ms */
+                if (garudaData.state <= ESC_ARMED && rate > cpuBaselineRate)
+                    cpuBaselineRate = rate;   /* auto-calibrate idle baseline */
+                if (rate >= cpuBaselineRate)
+                    garudaData.cpuLoadPermille = 0;
+                else
+                    garudaData.cpuLoadPermille =
+                        (uint16_t)(1000UL - (1000UL * rate) / cpuBaselineRate);
+                cpuLastSpins = cpuSpins;
+                cpuLastTick  = nowTick;
+            }
+        }
+
+#ifdef ENABLE_DIAGNOSTICS
+        DiagnosticsStepMain();  /* X2CScope serial communication */
+#endif
+#if FEATURE_GSP
+        GSP_Service();
+        /* Process detect intent immediately after GSP — minimize ISR window */
+        if (garudaData.gspDetectIntent)
+        {
+            garudaData.gspDetectIntent = false;
+            if (garudaData.state == ESC_IDLE)
+            {
+                garudaData.state = ESC_DETECT;
+            }
+        }
+#endif
+
+#if (FEATURE_RX_PWM || FEATURE_RX_DSHOT || FEATURE_RX_AUTO)
+        RX_Service();
+
+        /* Auto-arm from RX input: when RX link is locked and throttle is
+         * zero, arm the motor.  The ESC_ARMED handler (Timer1 ISR or FOC
+         * slow loop) verifies throttle stays at zero for ARM_TIME_MS
+         * before transitioning to ALIGN — this is the safety gate.
+         * Every real RC ESC auto-arms this way. */
+        if (garudaData.state == ESC_IDLE
+            && garudaData.rxLinkState == RX_LINK_LOCKED
+            && rxCachedLocked
+            && rxCachedThrottleAdc == 0)
+        {
+            garudaData.runCommandActive = true;
+            garudaData.desyncRestartAttempts = 0;
+            garudaData.armCounter = 0;
+            garudaData.state = ESC_ARMED;
+        }
+#endif
+
+#if FEATURE_FOC || FEATURE_FOC_V2 || FEATURE_FOC_V3 || FEATURE_FOC_AN1078
+        /* FOC LED2 state encoding:
+         *   IDLE: OFF, ARMED: 5Hz blink, CLOSED_LOOP: solid ON, FAULT: fast blink */
+        {
+            static uint16_t focLedCtr = 0;
+            ESC_STATE_T st = garudaData.state;
+            if (st == ESC_ARMED) {
+                /* 5 Hz blink using systemTick (1ms) — toggle every 100ms */
+                if (++focLedCtr >= 100) {
+                    focLedCtr = 0;
+                    LED2 ^= 1;
+                }
+            } else if (st == ESC_FAULT) {
+                /* Fast blink (~10 Hz) */
+                if (++focLedCtr >= 50) {
+                    focLedCtr = 0;
+                    LED2 ^= 1;
+                }
+            } else {
+                focLedCtr = 0;
+                /* CLOSED_LOOP: LED2 set by ADC ISR slow loop
+                 * IDLE: LED2 cleared by stop handler */
+            }
+        }
+#endif
+
+        /* Board service — button debounce at 1ms rate */
+        BoardService();
+
+        /* Button 1 (SW1) — Start/Stop motor */
+        if (IsPressed_Button1())
+        {
+            if (garudaData.state == ESC_IDLE)
+            {
+                /* Enter arming — Timer1 ESC_ARMED handler verifies throttle=0
+                 * for ARM_TIME_MS, then transitions to ESC_ALIGN.
+                 * Init before state change: Timer1 ISR (prio 5) can
+                 * preempt main between writes. */
+                garudaData.runCommandActive = true;
+                garudaData.desyncRestartAttempts = 0;
+                garudaData.armCounter = 0;
+                garudaData.state = ESC_ARMED;
+#if FEATURE_ADAPTATION
+                if (ADAPT_IsSafeBoundary(ESC_ARMED, garudaData.throttle))
+                {
+                    /* Adaptation params already evaluated; applied here */
+                }
+#endif
+            }
+            else if (garudaData.state == ESC_FAULT)
+            {
+                /* Clear fault and return to idle.
+                 * State first: ADC ISR (prio 6) sees IDLE immediately,
+                 * skips CL case, so HWZC_Disable's fallbackPending=true
+                 * is never consumed by the fallback re-seed path. */
+                garudaData.state = ESC_IDLE;
+                garudaData.runCommandActive = false;
+                garudaData.desyncRestartAttempts = 0;
+                garudaData.faultCode = FAULT_NONE;
+#if FEATURE_ADC_CMP_ZC
+                if (garudaData.hwzc.enabled)
+                    HWZC_Disable(&garudaData);
+                garudaData.hwzc.fallbackPending = false;
+#endif
+                HAL_MC1ClearPWMPCIFault();
+                HAL_MC1PWMDisableOutputs();
+                LED2 = 0;
+            }
+            else
+            {
+                /* Stop motor (any running state including ESC_RECOVERY).
+                 * State first: same preemption safety as fault-clear. */
+                garudaData.state = ESC_IDLE;
+                garudaData.runCommandActive = false;
+                garudaData.desyncRestartAttempts = 0;
+#if FEATURE_ADC_CMP_ZC
+                if (garudaData.hwzc.enabled)
+                    HWZC_Disable(&garudaData);
+                garudaData.hwzc.fallbackPending = false;
+#endif
+                HAL_MC1PWMDisableOutputs();
+                LED2 = 0;
+            }
+        }
+
+#if DIAGNOSTIC_MANUAL_STEP
+        /* DIAGNOSTIC: SW2 manually advances one commutation step.
+         * Only active when motor is running (ALIGN/OL_RAMP/CLOSED_LOOP). */
+        if (IsPressed_Button2())
+        {
+            if (garudaData.state == ESC_OL_RAMP ||
+                garudaData.state == ESC_CLOSED_LOOP)
+            {
+                COMMUTATION_AdvanceStep(&garudaData);
+                HAL_PWM_SetDutyCycle(garudaData.duty);
+                LED2 ^= 1;  /* Toggle LED2 as visual step indicator */
+            }
+        }
+#else
+        /* Button 2 (SW2) — Change direction (IDLE only — safe) */
+        if (IsPressed_Button2())
+        {
+            if (garudaData.state == ESC_IDLE)
+            {
+                garudaData.direction ^= 1;
+            }
+        }
+#endif
+
+#if FEATURE_GSP
+        /* GSP intent flags — process in main loop (not ISR).
+         * Same logic as SW1 button but triggered by GSP commands. */
+        if (garudaData.gspStartIntent)
+        {
+            garudaData.gspStartIntent = false;
+            if (garudaData.state == ESC_IDLE)
+            {
+                garudaData.runCommandActive = true;
+                garudaData.desyncRestartAttempts = 0;
+                garudaData.armCounter = 0;
+                garudaData.state = ESC_ARMED;
+            }
+        }
+        if (garudaData.gspStopIntent)
+        {
+            garudaData.gspStopIntent = false;
+            if (garudaData.state != ESC_IDLE && garudaData.state != ESC_FAULT)
+            {
+                garudaData.state = ESC_IDLE;
+                garudaData.runCommandActive = false;
+                garudaData.desyncRestartAttempts = 0;
+#if FEATURE_ADC_CMP_ZC
+                if (garudaData.hwzc.enabled)
+                    HWZC_Disable(&garudaData);
+                garudaData.hwzc.fallbackPending = false;
+#endif
+                HAL_MC1PWMDisableOutputs();
+                LED2 = 0;
+            }
+        }
+        if (garudaData.gspFaultClearIntent)
+        {
+            garudaData.gspFaultClearIntent = false;
+            if (garudaData.state == ESC_FAULT)
+            {
+                garudaData.state = ESC_IDLE;
+                garudaData.runCommandActive = false;
+                garudaData.desyncRestartAttempts = 0;
+                garudaData.faultCode = FAULT_NONE;
+#if FEATURE_ADC_CMP_ZC
+                if (garudaData.hwzc.enabled)
+                    HWZC_Disable(&garudaData);
+                garudaData.hwzc.fallbackPending = false;
+#endif
+                HAL_MC1ClearPWMPCIFault();
+                HAL_MC1PWMDisableOutputs();
+                LED2 = 0;
+            }
+        }
+
+        /* Heartbeat watchdog — only when GSP throttle + motor active */
+        if (garudaData.throttleSource == THROTTLE_SRC_GSP
+            && garudaData.runCommandActive)
+        {
+            uint32_t elapsed = garudaData.systemTick - garudaData.lastGspPacketTick;
+            if (elapsed > GSP_HEARTBEAT_TIMEOUT_MS)
+            {
+                /* Lost connection — safe stop via zero throttle + stop intent.
+                 * Do NOT switch throttleSource (Finding 43): with FEATURE_ADC_POT=0,
+                 * ADC source is invalid. Motor stops via zero throttle + gspStopIntent. */
+                garudaData.gspThrottle = 0;
+                garudaData.gspStopIntent = true;
+            }
+        }
+#endif /* FEATURE_GSP */
+
+#if FEATURE_LEARN_MODULES
+        /* Learning modules dispatcher (quality/health/adaptation) */
+        LEARN_Service(&garudaData, garudaData.systemTick);
+#endif
+
+#if FEATURE_COMMISSION
+        /* Self-commissioning state machine (when active) */
+        if (garudaData.commission.state > COMM_IDLE &&
+            garudaData.commission.state < COMM_COMPLETE)
+        {
+            COMMISSION_Update(&garudaData.commission, &garudaData,
+                              &telemRing, garudaData.systemTick);
+        }
+#endif
+    }
+
+    return 0;
+}
