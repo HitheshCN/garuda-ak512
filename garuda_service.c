@@ -1,4 +1,4 @@
-﻿/**
+/**
  * @file garuda_service.c
  *
  * @brief ESC state machine and ADC ISR.

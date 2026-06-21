@@ -44,9 +44,8 @@ extern "C" {
  * latches → FPCI kills outputs. FOC disables FPCI acceptance via
  * qualifier gating (ACP=1 edge + AQSS=LEB + LEB=0 → never qualifies).
  * Software OC via ADC ibusRaw protects in FOC mode instead. */
-#if !FEATURE_FOC && !FEATURE_FOC_V2
+
 #define ENABLE_PWM_FAULT_PCI
-#endif
 #if GARUDA_TARGET_AK512
 #define PCI_FAULT_ACTIVE_STATUS     PG1STATbits.FLT1ACT
 #else
@@ -116,12 +115,9 @@ void HAL_PWM_IbusProbeOnCenter(void);
 extern volatile uint8_t g_pwmDiffLow;
 #endif
 
-#if (FEATURE_SINE_STARTUP || FEATURE_FOC || FEATURE_FOC_V2 || FEATURE_FOC_V3 || FEATURE_FOC_AN1078)
+#if FEATURE_SINE_STARTUP 
 void HAL_PWM_SetDutyCycle3Phase(uint32_t dutyA, uint32_t dutyB, uint32_t dutyC);
 void HAL_PWM_ReleaseAllOverrides(void);
-#endif
-#if FEATURE_FOC || FEATURE_FOC_V2 || FEATURE_FOC_V3 || FEATURE_FOC_AN1078
-void HAL_PWM_SetDutyFloat3Phase(float da, float db, float dc);
 #endif
 #if FEATURE_SINE_STARTUP
 void HAL_PWM_ReleaseFloatPhase(uint8_t step);

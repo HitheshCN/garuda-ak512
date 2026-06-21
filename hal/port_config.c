@@ -91,34 +91,6 @@ void SetupGPIOPorts(void)
  */
 void MapGPIOHWFunction(void)
 {
-#if FEATURE_FOC || FEATURE_FOC_V2 || FEATURE_FOC_V3 || FEATURE_FOC_AN1078
-    /* ================================================================
-     * Phase Current Sensing via OA1/OA2 (Internal Op-Amps) — FOC modes
-     * OA1IN+ : RA4  (DIM:013), OA1IN- : RA3  (DIM:015)
-     * OA1OUT : RA2  (DIM:017) → AD1AN0 (Ia)
-     * OA2IN+ : RB2  (DIM:021), OA2IN- : RB1  (DIM:023)
-     * OA2OUT : RB0  (DIM:025) → AD2AN1 (Ib)
-     * From reference: port_config.c:126-145
-     * ================================================================ */
-#if GARUDA_TARGET_AK512
-    /* MC510: identical OA1/OA2 pins (OA1IN+ RA4, OA1IN- RA3, OA1OUT RA2,
-     * OA2IN+ RB2, OA2IN- RB1, OA2OUT RB0). AN957 internal-op-amp mode
-     * drives the OUT pins with TRIS=0 — mirror that convention here. */
-    ANSELAbits.ANSELA4 = 1; TRISAbits.TRISA4 = 1;   /* OA1IN+ */
-    ANSELAbits.ANSELA3 = 1; TRISAbits.TRISA3 = 1;   /* OA1IN- */
-    ANSELAbits.ANSELA2 = 1; TRISAbits.TRISA2 = 0;   /* OA1OUT (AN957: TRIS=0, op-amp drives pin) */
-    ANSELBbits.ANSELB2 = 1; TRISBbits.TRISB2 = 1;   /* OA2IN+ */
-    ANSELBbits.ANSELB1 = 1; TRISBbits.TRISB1 = 1;   /* OA2IN- */
-    ANSELBbits.ANSELB0 = 1; TRISBbits.TRISB0 = 0;   /* OA2OUT (AN957: TRIS=0, op-amp drives pin) */
-#else
-    ANSELAbits.ANSELA4 = 1; TRISAbits.TRISA4 = 1;   /* OA1IN+ */
-    ANSELAbits.ANSELA3 = 1; TRISAbits.TRISA3 = 1;   /* OA1IN- */
-    ANSELAbits.ANSELA2 = 1; TRISAbits.TRISA2 = 1;   /* OA1OUT (TRIS=1: disable digital output, let OA drive) */
-    ANSELBbits.ANSELB2 = 1; TRISBbits.TRISB2 = 1;   /* OA2IN+ */
-    ANSELBbits.ANSELB1 = 1; TRISBbits.TRISB1 = 1;   /* OA2IN- */
-    ANSELBbits.ANSELB0 = 1; TRISBbits.TRISB0 = 1;   /* OA2OUT (TRIS=1: disable digital output, let OA drive) */
-#endif /* GARUDA_TARGET_AK512 */
-#else
 #if GARUDA_TARGET_AK512
     /* 6-step diagnostic phase-current monitor: same OA1/OA2 pins on MC510.
      * AN957 convention: op-amp OUT pins TRIS=0 (internal op-amp mode). */
@@ -170,7 +142,6 @@ void MapGPIOHWFunction(void)
     ANSELAbits.ANSELA10 = 1;
     TRISAbits.TRISA10 = 1;
 #endif /* GARUDA_TARGET_AK512 */
-#endif
 
 #if GARUDA_TARGET_AK512
     /* ================================================================

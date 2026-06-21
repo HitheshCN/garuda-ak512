@@ -1097,7 +1097,7 @@ void HAL_PWM_IbusProbeOnCenter(void)
 }
 #endif
 
-#if (FEATURE_SINE_STARTUP || FEATURE_FOC || FEATURE_FOC_V2 || FEATURE_FOC_V3 || FEATURE_FOC_AN1078 || FEATURE_IF_STARTUP)
+#if (FEATURE_SINE_STARTUP || FEATURE_IF_STARTUP)
 /**
  * @brief Set independent duty cycles on all three PWM generators.
  * Used by sine startup and FOC SVM to drive 3-phase waveforms.
@@ -1185,9 +1185,9 @@ void HAL_PWM_FloatPhaseToHiZ(uint8_t step)
 #endif
     }
 }
-#endif /* FEATURE_SINE_STARTUP || FEATURE_FOC || FEATURE_FOC_V2 */
+#endif /* FEATURE_SINE_STARTUP */
 
-#if FEATURE_FOC || FEATURE_FOC_V2 || FEATURE_FOC_V3 || FEATURE_FOC_AN1078 || FEATURE_IF_STARTUP
+#if FEATURE_IF_STARTUP
 /**
  * @brief Set 3-phase PWM duty cycles from float [0.0, 1.0] values.
  * Converts normalised float duties to PWM register counts, clamps,
@@ -1216,4 +1216,4 @@ void HAL_PWM_SetDutyFloat3Phase(float da, float db, float dc)
     PG2DC = b;  /* Slave B */
     PG1DC = a;  /* Master A last (triggers broadcast) */
 }
-#endif /* FEATURE_FOC || FEATURE_FOC_V2 */
+#endif 

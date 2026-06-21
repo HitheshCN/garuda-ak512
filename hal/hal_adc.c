@@ -32,7 +32,7 @@ void InitializeADCs(void)
  * PINSEL repurpose at IF entry read OA2 as railed garbage; channel config with
  * ADON=1 is unreliable per datasheet). The 6-step BEMF machinery runs inert
  * against these channels during the I-f ramp; M2 will do the proper handoff. */
-#if FEATURE_FOC || FEATURE_FOC_V2 || FEATURE_FOC_V3 || FEATURE_FOC_AN1078 || FEATURE_IF_STARTUP
+#if FEATURE_IF_STARTUP
 #if GARUDA_TARGET_AK512
     /* Ia on AD1CH0: OA1OUT = RA2 = AD1AN0, PINSEL=0 (AN957) */
     AD1CH0CON1bits.PINSEL = 0;
@@ -244,7 +244,7 @@ void InitializeADCs(void)
 #endif /* GARUDA_TARGET_AK512 */
 #endif
 
-#if !FEATURE_FOC && !FEATURE_FOC_V2 && !FEATURE_FOC_V3 && !FEATURE_FOC_AN1078 && !FEATURE_IF_STARTUP
+#if !FEATURE_IF_STARTUP
     /* 6-step Phase-current monitor channels — diagnostic peak tracking.
      *
      * AD1CH3 samples OA1OUT (phase A low-side shunt amp) at 1 MHz via
@@ -345,7 +345,7 @@ void InitializeADCs(void)
 #else
     AD3CH2CON1bits.TRG1SRC = 4;    /* VBUS from PWM1 trigger (MPER/2 freewheel) */
 #endif
-#if !FEATURE_FOC && !FEATURE_FOC_V2 && !FEATURE_FOC_V3 && !FEATURE_FOC_AN1078 && !FEATURE_IF_STARTUP
+#if !FEATURE_IF_STARTUP
     AD1CH3CON1bits.TRG1SRC = 4;    /* Phase B (VB) from PWM1 trigger */
     AD1CH4CON1bits.TRG1SRC = 4;    /* Phase A (VA) from PWM1 trigger */
     AD2CH3CON1bits.TRG1SRC = 4;    /* Phase C (VC) from PWM1 trigger */
@@ -374,8 +374,6 @@ void InitializeADCs(void)
     AD1CH4CONbits.TRG1SRC = 4;     /* VBUS from PWM1 trigger */
 #endif /* GARUDA_TARGET_AK512 */
 }
-
-#if !FEATURE_FOC && !FEATURE_FOC_V2 && !FEATURE_FOC_V3 && !FEATURE_FOC_AN1078
 
 #if GARUDA_TARGET_AK512 && !FEATURE_IF_STARTUP
 /* Active floating phase for the PWM-synced A/C read (set per commutation by
@@ -439,11 +437,9 @@ bool HAL_ADC_SelectBEMFChannel(uint8_t floatingPhase)
             return false;
     }
 #endif /* GARUDA_TARGET_AK512 */
-}
-#endif /* !FEATURE_FOC && !FEATURE_FOC_V2 */
+} 
 
 #if FEATURE_ADC_CMP_ZC
-
 /**
  * @brief Post-ON setup for high-speed BEMF comparator channels.
  * Channel configuration (PINSEL, SAMC, TRG1SRC=14) is done in
