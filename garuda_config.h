@@ -264,13 +264,6 @@ extern "C" {
                                     * beats a wrong-angle slam); listen timeout (~100ms) falls
                                     * back to today's hot hand-off. Conventional waveform only —
                                     * none of the CL_DIFF_IDLE machinery activates. */
-/* FOC (Field-Oriented Control) — compile-time alternative to 6-step */
-#define FEATURE_FOC              0  /* Phase I: OLD FOC v1 (reference, deprecated) */
-#define FEATURE_FOC_V2           0  /* Phase I v2: closed-loop current control + MXLEMMING */
-#define FEATURE_FOC_V3           0  /* Phase J: FOC v3 — SMO observer + PLL */
-#define FEATURE_FOC_AN1078       0  /* 2026-05-25: switched to 6-step. Flip back to 1 to return to FOC AN1078. */
-#define FEATURE_SMO              0  /* 0=PLL only, 1=PLL+SMO parallel (v1 only) */
-#define FEATURE_MXLEMMING        0  /* 0=PLL chain, 1=MXLEMMING flux observer (v1 only) */
 #define FEATURE_LEARN_MODULES    0  /* master: ring buffer + quality + health */
 #define FEATURE_ADAPTATION       0  /* requires FEATURE_LEARN_MODULES */
 #define FEATURE_COMMISSION       0  /* requires FEATURE_LEARN_MODULES */
@@ -316,15 +309,6 @@ extern "C" {
  * No automatic ramp — user controls step timing.
  * Set to 0 for normal auto-ramp operation. */
 #define DIAGNOSTIC_MANUAL_STEP  0
-
-/* FOC diagnostic levels (requires FEATURE_FOC=1):
- * 0 = Normal FOC (production)
- * 1 = PWM-only: 50% duty, no FOC math (tests PWM hardware)
- * 2 = Open-loop voltage: applies fixed Vq, reads current (tests current sense)
- *     Check focIa/focIb/focSubState in watch. Expect:
- *       focSubState=98, Iq≈Vq/Rs (positive = correct polarity)
- * 3 = FOC with PI but no feedforward (tests PI only) */
-#define FOC_DIAG_PWM_TEST       2
 
 /* Learn module tuning (only compiled when FEATURE_LEARN_MODULES=1) */
 #if FEATURE_LEARN_MODULES
@@ -427,7 +411,7 @@ extern "C" {
                                       * current (Ia 0.5, Ibus 0) and could not spin -> CMP3->CLPCI chop
                                       * chain CONFIRMED LIVE. Now 0 = chop at the real DAC threshold. */
 
-#define MOTOR_PROFILE  6   /* 2026-06-17 VEX: profile 6 now carries the baked λ=230 + 6PP +
+#define MOTOR_PROFILE  2   /* 2026-06-17 VEX: profile 6 now carries the baked λ=230 + 6PP +
                               * proven low-hand-off startup (ported from profile 2). No live
                               * 0x72 override needed. Switch back to 2 for the 2810.
                               * 0=Hurst 1=A2212@12V 2=2810@24V 3=5055 4=Cobra 5=XRotor
@@ -458,7 +442,7 @@ extern "C" {
 #define OC_SW_LIMIT_MA            1500     /* Software soft limit (1.5A) */
 #define RAMP_CURRENT_GATE_MA         0     /* 0=disabled: Hurst starts easily without gating */
 #define FEATURE_PRESYNC_RAMP       0       /* Hurst: standard forced OL_RAMP */
-#define OC_CLPCI_ENABLE            0       /* Disabled for FOC: SVPWM incompatible with CLPCI chopping */
+#define OC_CLPCI_ENABLE            0       /* Disabled for Hurst bench testing */
 
 #elif MOTOR_PROFILE == 1
 /* === A2212 1400KV (drone motor) ===

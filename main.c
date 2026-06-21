@@ -151,14 +151,10 @@ int main(void)
 #endif
 #if FEATURE_GSP
         GSP_Service();
-        /* Process detect intent immediately after GSP — minimize ISR window */
+        /* Process detect intent — no-op after FOC removal */
         if (garudaData.gspDetectIntent)
         {
             garudaData.gspDetectIntent = false;
-            if (garudaData.state == ESC_IDLE)
-            {
-                garudaData.state = ESC_DETECT;
-            }
         }
 #endif
 
@@ -179,32 +175,6 @@ int main(void)
             garudaData.desyncRestartAttempts = 0;
             garudaData.armCounter = 0;
             garudaData.state = ESC_ARMED;
-        }
-#endif
-
-#if FEATURE_FOC || FEATURE_FOC_V2 || FEATURE_FOC_V3 || FEATURE_FOC_AN1078
-        /* FOC LED2 state encoding:
-         *   IDLE: OFF, ARMED: 5Hz blink, CLOSED_LOOP: solid ON, FAULT: fast blink */
-        {
-            static uint16_t focLedCtr = 0;
-            ESC_STATE_T st = garudaData.state;
-            if (st == ESC_ARMED) {
-                /* 5 Hz blink using systemTick (1ms) — toggle every 100ms */
-                if (++focLedCtr >= 100) {
-                    focLedCtr = 0;
-                    LED2 ^= 1;
-                }
-            } else if (st == ESC_FAULT) {
-                /* Fast blink (~10 Hz) */
-                if (++focLedCtr >= 50) {
-                    focLedCtr = 0;
-                    LED2 ^= 1;
-                }
-            } else {
-                focLedCtr = 0;
-                /* CLOSED_LOOP: LED2 set by ADC ISR slow loop
-                 * IDLE: LED2 cleared by stop handler */
-            }
         }
 #endif
 

@@ -253,56 +253,13 @@ _Static_assert(MIN_ADC_STEP_PERIOD > MIN_CL_ADC_STEP_PERIOD,
 #error "FEATURE_X2CSCOPE and FEATURE_GSP are mutually exclusive (both use UART1)"
 #endif
 
-/* FOC mutual exclusion guards */
-#if FEATURE_FOC && FEATURE_FOC_V2
-#error "FEATURE_FOC (v1) and FEATURE_FOC_V2 are mutually exclusive"
-#endif
-#if FEATURE_FOC && FEATURE_BEMF_CLOSED_LOOP
-#error "FEATURE_FOC and FEATURE_BEMF_CLOSED_LOOP are mutually exclusive"
-#endif
-#if FEATURE_FOC_V2 && FEATURE_BEMF_CLOSED_LOOP
-#error "FEATURE_FOC_V2 and FEATURE_BEMF_CLOSED_LOOP are mutually exclusive"
-#endif
-#if FEATURE_FOC && FEATURE_SINE_STARTUP
-#error "FEATURE_FOC and FEATURE_SINE_STARTUP are mutually exclusive"
-#endif
-#if FEATURE_FOC_V2 && FEATURE_SINE_STARTUP
-#error "FEATURE_FOC_V2 and FEATURE_SINE_STARTUP are mutually exclusive"
-#endif
-#if FEATURE_FOC && FEATURE_ADC_CMP_ZC
-#error "FEATURE_FOC and FEATURE_ADC_CMP_ZC are mutually exclusive"
-#endif
-#if FEATURE_FOC_V2 && FEATURE_ADC_CMP_ZC
-#error "FEATURE_FOC_V2 and FEATURE_ADC_CMP_ZC are mutually exclusive"
-#endif
 #if FEATURE_PLL_STARTUP && (!FEATURE_ADC_CMP_ZC || !FEATURE_HWZC_SECTOR_PI)
 #error "FEATURE_PLL_STARTUP requires ADC_CMP_ZC + HWZC_SECTOR_PI (the PI/SCCP1 machinery)"
 #endif
 #if FEATURE_AM32_STARTUP && (!FEATURE_ADC_CMP_ZC || !FEATURE_HWZC_SECTOR_PI)
 #error "FEATURE_AM32_STARTUP requires ADC_CMP_ZC + HWZC_SECTOR_PI (the listener)"
 #endif
-#if FEATURE_FOC && DIAGNOSTIC_MANUAL_STEP
-#error "FEATURE_FOC and DIAGNOSTIC_MANUAL_STEP are mutually exclusive"
-#endif
-#if FEATURE_FOC_V2 && DIAGNOSTIC_MANUAL_STEP
-#error "FEATURE_FOC_V2 and DIAGNOSTIC_MANUAL_STEP are mutually exclusive"
-#endif
-
-/* MXLEMMING requires FOC v1 */
-#if FEATURE_MXLEMMING && !FEATURE_FOC
-#error "FEATURE_MXLEMMING requires FEATURE_FOC"
-#endif
-
-/* FOC SVM switches all 3 phases at different instants — LEB only covers one
- * edge, so CMP3 false-trips on switching ringing. Force CLPCI off; software
- * overcurrent (OC_PROTECT_MODE 1 or 2 software path) still protects. */
-#if (FEATURE_FOC || FEATURE_FOC_V2 || FEATURE_FOC_V3 || FEATURE_FOC_AN1078) && OC_CLPCI_ENABLE
-#undef OC_CLPCI_ENABLE
-#define OC_CLPCI_ENABLE 0
-#endif
-
-/* 6-step feature dependency guards (N/A when FOC active) */
-#if !FEATURE_FOC && !FEATURE_FOC_V2 && !FEATURE_FOC_V3 && !FEATURE_FOC_AN1078
+/* 6-step feature dependency guards */
 #if FEATURE_TIMING_ADVANCE && !FEATURE_BEMF_CLOSED_LOOP
 #error "Timing advance requires FEATURE_BEMF_CLOSED_LOOP"
 #endif
@@ -405,8 +362,6 @@ _Static_assert(MORPH_WINDOW_MIN_TICKS >= 5,
 #if FEATURE_ADC_CMP_ZC && !FEATURE_BEMF_CLOSED_LOOP
 #error "ADC comparator ZC requires FEATURE_BEMF_CLOSED_LOOP"
 #endif
-#endif /* !FEATURE_FOC && !FEATURE_FOC_V2 — end of 6-step dependency guards */
-
 #if FEATURE_ADC_CMP_ZC
 /* SCCP2 clock = SCCP peripheral bus = 100 MHz */
 #define HWZC_TIMER_HZ           SCCP_CLOCK_HZ
@@ -584,16 +539,13 @@ _Static_assert(RAMP_CURRENT_GATE_ADC < OC_CMP3_DAC_VAL,
 
 #endif /* FEATURE_HW_OVERCURRENT */
 
-/* ── FOC compile-time constants ─────────────────────────────────────── */
-#if FEATURE_FOC || FEATURE_FOC_V2
-/* FOC current/voltage scaling now in garuda_foc_params.h:
- * CURRENT_SCALE_A_PER_COUNT, VBUS_SCALE_V_PER_COUNT, ADC_MIDPOINT.
- * These are derived from the board shunt (3 mohm) and DIM diff-amp gain (24.95x).
- * OA3 (bus current for FEATURE_HW_OVERCURRENT) uses the same shunt/gain path.
- *
- * Legacy AN1292 defines (VBUS_ADC_TO_VOLTS, ADC_CURRENT_SCALE) removed;
- * garuda_foc_params.h provides the canonical values. */
-#endif /* FEATURE_FOC || FEATURE_FOC_V2 */
+/* ── ADC / hardware scaling constants ───────────────────────────────── */
+/* Vbus divider: R_top=220k, R_bot=10k → ratio = (220+10)/10 = 23.
+ * Measured value 23.2 from board calibration. */
+#define ADC_VREF_V              3.3f
+#define ADC_FULL_SCALE_F        4095.0f
+#define VBUS_DIVIDER_RATIO      23.2f
+#define VBUS_SCALE_V_PER_COUNT  (ADC_VREF_V * VBUS_DIVIDER_RATIO / ADC_FULL_SCALE_F)
 
 /* ── Runtime parameter macros ────────────────────────────────────────── *
  * When FEATURE_GSP=1, these read from the GSP runtime param system

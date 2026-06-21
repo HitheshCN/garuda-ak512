@@ -30,9 +30,7 @@
 #include "../garuda_calc_params.h"
 #include "../hal/hal_adc.h"
 #include "../hal/hal_timer.h"
-#if (FEATURE_HWZC_PI_FLOAT && HWZC_PI_FF_ENABLE) || FEATURE_HWZC_ABS_FLOOR
-#include "../garuda_foc_params.h"   /* VBUS_SCALE_V_PER_COUNT, focKeUvSRad scaling */
-#endif
+/* VBUS_SCALE_V_PER_COUNT defined in garuda_calc_params.h */
 #include <xc.h>
 
 /**
@@ -167,7 +165,8 @@ void HWZC_Enable(volatile GARUDA_DATA_T *pData)
     {
         float dutyFrac = (float)pData->duty / (float)LOOPTIME_TCY;
         float vbus_v   = (float)pData->vbusRaw * VBUS_SCALE_V_PER_COUNT;
-        float lambdaPm = (float)gspParams.focKeUvSRad;
+        /* focKeUvSRad removed with FOC. FF seed disabled. */
+        float lambdaPm = 0.0f;
         if (dutyFrac > 0.03f && vbus_v > 6.0f && lambdaPm > 0.0f) {
             float P_ff = (181.380f * lambdaPm) / (vbus_v * dutyFrac);
             /* Only adopt FF if it predicts a SLOWER controller
@@ -924,11 +923,12 @@ void HWZC_OnPiPeriodExpired(volatile GARUDA_DATA_T *pData)
          * so the commanded period cannot be shorter than P_ff/(overspeed margin).
          * Reuses the FF-seed no-load-period formula (see HWZC_Enable). */
         {
-            float dutyFrac = (float)pData->duty / (float)LOOPTIME_TCY;
-            float vbus_v   = (float)pData->vbusRaw * VBUS_SCALE_V_PER_COUNT;
-            float lambdaPm = (float)gspParams.focKeUvSRad;
-            if (dutyFrac > HWZC_ABS_FLOOR_MIN_DUTYFRAC && vbus_v > 6.0f
-                && lambdaPm > 0.0f) {
+        float dutyFrac = (float)pData->duty / (float)LOOPTIME_TCY;
+        float vbus_v   = (float)pData->vbusRaw * VBUS_SCALE_V_PER_COUNT;
+        /* focKeUvSRad removed with FOC. Abs-floor feedforward disabled. */
+        float lambdaPm = 0.0f;
+        if (dutyFrac > HWZC_ABS_FLOOR_MIN_DUTYFRAC && vbus_v > 6.0f
+            && lambdaPm > 0.0f) {
                 float P_ff = (181.380f * lambdaPm) / (vbus_v * dutyFrac);
                 uint32_t floorP = (uint32_t)(P_ff *
                     (100.0f / (float)HWZC_ABS_FLOOR_OVERSPEED_PCT));

@@ -22,7 +22,6 @@ typedef enum
 {
     ESC_IDLE = 0,
     ESC_ARMED,
-    ESC_DETECT,         /* Auto-commissioning (FOC V2 only) */
     ESC_ALIGN,
     ESC_OL_RAMP,
     ESC_MORPH,          /* Sine-to-trap waveform morph */
@@ -618,9 +617,6 @@ typedef enum
     FAULT_STARTUP_TIMEOUT,  /* Pre-sync timeout: ZC never achieved within PRESYNC_TIMEOUT_MS */
     FAULT_MORPH_TIMEOUT,    /* Morph did not achieve ZC lock */
     FAULT_RX_LOSS,          /* RX signal lost (PWM/DShot/AUTO) — requires CLEAR_FAULT */
-    FAULT_FOC_INTERNAL,     /* FOC internal fault (estimator divergence, overcurrent) */
-    FAULT_OBSERVER,         /* Observer lost tracking (sustained reverse speed in CL) */
-    FAULT_FOC_BUSLOSS,      /* HW OC tripped: voltage applied but no current flows */
     FAULT_TRAP_BUS,         /* CPU bus error trap */
     FAULT_TRAP_ILLEGAL,     /* Illegal instruction trap */
     FAULT_TRAP_ADDRESS,     /* CPU address error trap */
@@ -679,7 +675,6 @@ typedef struct
     HWZC_STATE_T hwzc;
 #endif
 
-#if !FEATURE_FOC && !FEATURE_FOC_V2 && !FEATURE_FOC_V3 && !FEATURE_FOC_AN1078
     /* 6-step diagnostic phase-current monitor (AD1CH3=Ia, AD2CH2=Ib via
      * PG1TRIGA @ 24 kHz). Scale ~93 counts/A, bias ~2048 (0 A).
      *
@@ -716,7 +711,6 @@ typedef struct
         uint16_t ibusMinAtFault;
         uint8_t  faultCaptured; /* 1 once we've latched an at-fault snapshot; 0 = no fault yet */
     } phaseCurrent;
-#endif
 
 #if FEATURE_HW_OVERCURRENT
     uint16_t ibusRaw;             /* Bus current ADC (biased ~2048, ~93 counts/A) — instantaneous conduction */
@@ -751,89 +745,6 @@ typedef struct
     bool gspStopIntent;
     bool gspFaultClearIntent;
     bool gspDetectIntent;       /* Auto-commissioning trigger */
-#endif
-
-#if FEATURE_FOC
-    /* FOC v1 telemetry (updated by ADC ISR, read by main/GSP) */
-    float       focIa;          /* Phase A current (A) */
-    float       focIb;          /* Phase B current (A) */
-    float       focTheta;       /* PLL electrical angle (rad) */
-    float       focOmega;       /* PLL electrical speed (rad/s) */
-    float       focVbus;        /* Bus voltage (V) */
-    float       focIdcEst;      /* Estimated DC bus current (A) */
-    float       focTheta2;      /* Flux estimator angle (parallel, rad) */
-    uint8_t     focSubState;    /* Internal FOC sub-state (0=align,1=OL,2=running) */
-    uint16_t    focOffsetIa;    /* Calibrated ADC offset Ia */
-    uint16_t    focOffsetIb;    /* Calibrated ADC offset Ib */
-#if FEATURE_SMO
-    float       focSmoTheta;    /* SMO angle (rad) */
-    float       focSmoOmega;    /* SMO speed (rad/s) */
-#endif
-#endif
-
-#if FEATURE_FOC_V2
-    /* FOC v2 telemetry — proper Id/Iq (not raw phase currents) */
-    float       focIdMeas;      /* D-axis current (A) — should be ~0 */
-    float       focIqMeas;      /* Q-axis current (A) — torque */
-    float       focTheta;       /* Commutation angle (rad) */
-    float       focOmega;       /* PLL speed (rad/s) */
-    float       focVbus;        /* Bus voltage (V) */
-    float       focIa;          /* Phase A current (A, for debug) */
-    float       focIb;          /* Phase B current (A, for debug) */
-    float       focThetaObs;    /* Observer angle (rad) */
-    float       focVd;          /* D-axis voltage command (V) */
-    float       focVq;          /* Q-axis voltage command (V) */
-    /* Observer internals */
-    float       focFluxAlpha;   /* Observer flux alpha (V·s) */
-    float       focFluxBeta;    /* Observer flux beta (V·s) */
-    float       focLambdaEst;   /* Adaptive flux linkage estimate (V·s/rad) */
-    float       focObsGain;     /* Observer scheduled gain */
-    /* PI controller internals */
-    float       focPidDInteg;   /* D-axis PI integrator state */
-    float       focPidQInteg;   /* Q-axis PI integrator state */
-    float       focPidSpdInteg; /* Speed PI integrator state */
-    /* Derived diagnostics */
-    float       focModIndex;    /* Modulation index 0-1 (voltage utilization) */
-    float       focObsConfidence; /* Observer confidence 0-1 */
-    uint8_t     focSubState;    /* 0=idle,1=armed,2=align,3=if,4=cl */
-    uint16_t    focOffsetIa;    /* Calibrated ADC offset Ia */
-    uint16_t    focOffsetIb;    /* Calibrated ADC offset Ib */
-#endif
-
-#if FEATURE_FOC_V3 || FEATURE_FOC_AN1078
-    /* FOC v3 / AN1078 telemetry — SMO observer */
-    float       focIdMeas;      /* D-axis current (A) */
-    float       focIqMeas;      /* Q-axis current (A) — torque */
-    float       focTheta;       /* Commutation angle (rad) */
-    float       focOmega;       /* PLL speed (rad/s) */
-    float       focVbus;        /* Bus voltage (V) */
-    float       focIa;          /* Phase A current (A) */
-    float       focIb;          /* Phase B current (A) */
-    float       focThetaObs;    /* SMO angle (rad) */
-    float       focVd;          /* D-axis voltage command (V) */
-    float       focVq;          /* Q-axis voltage command (V) */
-    /* SMO internals (mapped to flux telemetry for GUI reuse) */
-    float       focFluxAlpha;   /* SMO back-EMF alpha (V) */
-    float       focFluxBeta;    /* SMO back-EMF beta (V) */
-    float       focLambdaEst;   /* Not used in v3 (0) */
-    float       focObsGain;     /* SMO gain K */
-    /* PI controller internals */
-    float       focPidDInteg;   /* D-axis PI integrator state */
-    float       focPidQInteg;   /* Q-axis PI integrator state */
-    float       focPidSpdInteg; /* Speed PI integrator state */
-    /* Derived diagnostics */
-    float       focModIndex;    /* Modulation index 0-1 */
-    float       focObsConfidence; /* Observer confidence 0-1 */
-    uint8_t     focSubState;    /* 0=idle,1=armed,2=align,3=ol,4=cl */
-    uint16_t    focOffsetIa;    /* Calibrated ADC offset Ia */
-    uint16_t    focOffsetIb;    /* Calibrated ADC offset Ib */
-    /* V4 observer diagnostics */
-    float       smoResidual;    /* LP-filtered current estimation error (A) */
-    float       pllInnovation;  /* LP-filtered PLL phase error (rad) */
-    float       pllOmega;       /* Raw PLL speed (rad/s) */
-    float       omegaOl;        /* OL forced speed / CL filtered speed (rad/s) */
-    uint16_t    handoffCtr;     /* Handoff dwell counter */
-    uint8_t     smoObservable;  /* Observer health flag */
 #endif
 
     /* RX input state (Phase H) — unconditional for status reporting */

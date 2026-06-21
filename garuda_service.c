@@ -1,11 +1,11 @@
-/**
+﻿/**
  * @file garuda_service.c
  *
  * @brief ESC state machine and ADC ISR.
  *
  * State machine (driven from ADC ISR at PWM rate):
- *   IDLE → ARMED (throttle=0 for 500ms) → ALIGN → OL_RAMP
- *   → (Phase 2: CLOSED_LOOP)
+ *   IDLE â†’ ARMED (throttle=0 for 500ms) â†’ ALIGN â†’ OL_RAMP
+ *   â†’ (Phase 2: CLOSED_LOOP)
  *
  * Timer1 ISR: 100us tick for heartbeat, board service, and commutation timing.
  *
@@ -43,66 +43,13 @@
 #include "input/rx_decode.h"
 #endif
 
-#if FEATURE_FOC
-#include <math.h>
-#include "garuda_foc_params.h"
-#include "foc/foc_types.h"
-#include "foc/clarke.h"
-#include "foc/park.h"
-#include "foc/svpwm.h"
-#include "foc/pi_controller.h"
-#include "foc/back_emf_obs.h"
-#include "foc/pll_estimator.h"
-#include "foc/flux_estimator.h"
-#if FEATURE_SMO
-#include "foc/smo_observer.h"
-#endif
-#if FEATURE_MXLEMMING
-#include "foc/mxlemming_obs.h"
-#endif
-#endif
-
-#if FEATURE_FOC_V2
-#include <math.h>
-#include "garuda_foc_params.h"
-#include "foc/foc_v2_types.h"
-#include "foc/foc_v2_control.h"
-#include "foc/foc_v2_detect.h"
-#include "hal/hal_pwm.h"
-#if FEATURE_GSP
-#include "gsp/gsp_params.h"
-#endif
-#endif
-
-#if FEATURE_FOC_V3
-#include <math.h>
-#include "garuda_foc_params.h"
-#include "foc/foc_v3_types.h"
-#include "foc/foc_v3_control.h"
-#include "hal/hal_pwm.h"
-#if FEATURE_GSP
-#include "gsp/gsp_params.h"
-#endif
-#endif
-
-#if FEATURE_FOC_AN1078
-#include <math.h>
-#include "garuda_foc_params.h"
-#include "foc/an1078_motor.h"
-#include "foc/an1078_params.h"
-#include "hal/hal_pwm.h"
-#if FEATURE_GSP
-#include "gsp/gsp_params.h"
-#endif
-#endif
-
 #if FEATURE_BURST_SCOPE
 #include "scope/scope_burst.h"
 #endif
 
 #include "x2cscope/diagnostics.h"
 
-/* Global ESC runtime data — volatile: shared between ISRs and main loop */
+/* Global ESC runtime data â€” volatile: shared between ISRs and main loop */
 volatile GARUDA_DATA_T garudaData;
 
 #if FEATURE_AM32_STARTUP
@@ -111,368 +58,170 @@ volatile GARUDA_DATA_T garudaData;
 static volatile uint8_t g_am32EntryPending;
 #endif
 
-#if FEATURE_FOC_V2
-/* FOC v2 state — accessed only from ADC ISR (not volatile) */
-static FOC_State_t s_foc_v2;
-/* Flag: set by profile load handler, checked by ISR to re-init FOC */
-volatile bool gspFocReinitNeeded;
-#elif FEATURE_FOC_V3
-/* FOC v3 state — SMO observer, accessed only from ADC ISR */
-static V3_State_t s_foc_v3;
-volatile bool gspFocReinitNeeded;
-#elif FEATURE_FOC_AN1078
-/* AN1078 motor controller — accessed only from ADC ISR */
-/* Non-static so gsp_commands.c can re-init the SMC observer when motor
- * model params (Rs/Ls/Ke) are changed via SET_PARAM — re-uses gspParams
- * values to recompute F_PLANT/G_PLANT without firmware recompile. */
-AN_Motor_T s_foc_an;
-volatile bool gspFocReinitNeeded;
-#endif
-
-#if FEATURE_FOC_V2 || FEATURE_FOC_V3
-/** Build FOC_MotorParams_t from GSP runtime params (or compile-time fallback).
- *  AN1078 uses its own constants in an1078_params.h, doesn't call this. */
-static FOC_MotorParams_t BuildFocMotorParams(void) __attribute__((unused));
-static FOC_MotorParams_t BuildFocMotorParams(void)
-{
-    FOC_MotorParams_t mp;
-#if FEATURE_GSP
-    mp.Rs             = (float)gspParams.focRsMilliOhm * 0.001f;
-    mp.Ls             = (float)gspParams.focLsMicroH * 1e-6f;
-    mp.Ke             = (float)gspParams.focKeUvSRad * 1e-6f;
-    mp.lambda_pm      = mp.Ke;  /* Ke = lambda_pm for PMSM */
-    mp.pole_pairs     = gspParams.motorPolePairs;
-    mp.vbus_nom_v     = (float)gspParams.focVbusNomCentiV * 0.01f;
-    mp.max_current_a  = (float)gspParams.focMaxCurrentCentiA * 0.01f;
-    mp.max_elec_rad_s = (float)gspParams.focMaxElecRadS;
-    mp.kp_dq          = (float)gspParams.focKpDqMilli * 0.001f;
-    mp.ki_dq          = (float)gspParams.focKiDq;
-    mp.obs_lpf_alpha  = (float)gspParams.focObsLpfAlphaMilli * 0.001f;
-    mp.align_iq_a     = (float)gspParams.focAlignIqCentiA * 0.01f;
-    mp.ramp_iq_a      = (float)gspParams.focRampIqCentiA * 0.01f;
-    mp.align_ticks    = (uint32_t)gspParams.focAlignTimeMs * 24U;  /* ms → 24kHz ticks */
-    mp.iq_ramp_ticks  = (uint32_t)gspParams.focIqRampTimeMs * 24U;
-    mp.ramp_rate_rps2 = (float)gspParams.focRampRateRps2;
-    mp.handoff_rad_s  = (float)gspParams.focHandoffRadS;
-    mp.fault_oc_a     = (float)gspParams.focFaultOcCentiA * 0.01f;
-    mp.fault_stall_rad_s = (float)gspParams.focFaultStallDeciRadS * 0.1f;
-#else
-    mp.Rs             = MOTOR_RS_OHM;
-    mp.Ls             = MOTOR_LS_H;
-    mp.lambda_pm      = MOTOR_FLUX_LINKAGE;
-    mp.Ke             = MOTOR_KE_VPEAK;
-    mp.pole_pairs     = MOTOR_POLE_PAIRS_FOC;
-    mp.max_current_a  = MOTOR_MAX_CURRENT_A;
-    mp.max_elec_rad_s = MOTOR_MAX_ELEC_RAD_S;
-    mp.vbus_nom_v     = MOTOR_VBUS_NOM_V;
-    mp.kp_dq          = KP_DQ;
-    mp.ki_dq          = KI_DQ;
-    mp.obs_lpf_alpha  = OBS_LPF_ALPHA;
-    mp.align_iq_a     = STARTUP_ALIGN_IQ_A;
-    mp.ramp_iq_a      = STARTUP_RAMP_IQ_A;
-    mp.align_ticks    = STARTUP_ALIGN_TICKS;
-    mp.iq_ramp_ticks  = STARTUP_IQ_RAMP_TICKS;
-    mp.ramp_rate_rps2 = STARTUP_RAMP_RATE_RPS2;
-    mp.handoff_rad_s  = STARTUP_HANDOFF_RAD_S;
-    mp.fault_oc_a     = FAULT_OC_A;
-    mp.fault_stall_rad_s = FAULT_STALL_RAD_S;
-#endif
-    return mp;
-}
-#endif
-
-#if FEATURE_FOC
-/* ── Module-level FOC state (accessed only from ADC ISR) ─────────────── */
-static PI_t         s_pid_d;        /* D-axis current PI */
-static PI_t         s_pid_q;        /* Q-axis current PI */
-static PI_t         s_pid_spd;      /* Speed PI (outer loop) */
-static BackEMFObs_t s_obs;          /* Back-EMF voltage-model observer */
-static PLL_t        s_pll;          /* PLL angle/speed estimator */
-static FluxEst_t    s_flux_est;     /* Flux-integration angle estimator (parallel) */
-#if FEATURE_SMO
-static SMO_t        s_smo;          /* Sliding Mode Observer (parallel) */
-static PLL_t        s_pll_smo;      /* PLL driven by SMO back-EMF estimates */
-#endif
-#if FEATURE_MXLEMMING
-static MxlObs_t     s_mxl;          /* MXLEMMING flux observer */
-#endif
-
-static float        s_iq_ref;       /* Q-axis current reference (A) */
-static float        s_vbus;         /* Last measured bus voltage (V) */
-static uint16_t     s_slow_ctr;     /* Slow loop counter (0 -> FOC_SLOW_DIV) */
-
-/* Open-loop startup ramp state */
-static float        s_theta_ol;     /* Open-loop angle (rad) */
-static float        s_omega_ol;     /* Open-loop speed (rad/s elec.) */
-static bool         s_ovr_released; /* True after overrides released this run */
-
-static uint32_t     s_iq_ramp_ctr;  /* Ticks elapsed since entry (Iq ramp) */
-static uint32_t     s_align_ctr;    /* Ticks elapsed during alignment dwell */
-
-/* PLL angle correction gain (per fast-loop tick): 2pi x BW x Ts */
-#define PLL_CORRECTION_GAIN  (6.28318530718f * PLL_CORRECTION_BW_HZ * FOC_TS_FAST_S)
-
-/* ADC zero-current offset calibration (sampled while motor is off) */
-#define CAL_SAMPLES  1024U
-#define CAL_SHIFT    10U
-static uint32_t     s_ia_accum;
-static uint32_t     s_ib_accum;
-static uint16_t     s_cal_count;
-static uint16_t     s_ia_offset;
-static uint16_t     s_ib_offset;
-static bool         s_cal_done;
-
-/* Stall timer (slow loop ticks) */
-static uint32_t     s_stall_ctr;
-
-/* I/f → closed-loop transition state */
-static bool         s_cl_active;    /* True after PLL lock → speed PI + PLL angle */
-static uint32_t     s_cl_lock_ctr;  /* Consecutive ticks PLL tracks OL within tolerance */
-
-/* Phase current OC debounce (software OC since ibusRaw=0 at PWM valley) */
-#define FOC_OC_DEBOUNCE  48U  /* 48 ticks @ 24kHz = 2ms */
-static uint16_t     s_foc_oc_ctr;
-
-/* Helper: get PLL rotor angle (corrected for BEMF->rotor offset) */
-static inline float pll_rotor_angle(void)
-{
-    float a = s_pll.theta_est - PLL_ANGLE_OFFSET;
-    if (a < 0.0f)            a += 6.28318530718f;
-    if (a >= 6.28318530718f) a -= 6.28318530718f;
-    return a;
-}
-
-#if FEATURE_SMO
-static inline float smo_rotor_angle(void)
-{
-    float a = s_pll_smo.theta_est - PLL_ANGLE_OFFSET;
-    if (a < 0.0f)            a += 6.28318530718f;
-    if (a >= 6.28318530718f) a -= 6.28318530718f;
-    return a;
-}
-#endif
-
-/* Forward declarations */
-static void foc_startup_reset(void);
-
-static void foc_startup_reset(void)
-{
-    s_theta_ol     = 0.0f;
-    s_omega_ol     = 0.0f;
-    s_ovr_released = false;
-    s_iq_ramp_ctr  = 0;
-    s_align_ctr    = 0;
-    s_cl_active    = false;
-    s_cl_lock_ctr  = 0;
-    s_foc_oc_ctr   = 0;
-    pi_reset(&s_pid_d);
-    pi_reset(&s_pid_q);
-    pi_reset(&s_pid_spd);
-    s_iq_ref    = 0.0f;
-    s_stall_ctr = 0;
-    flux_est_reset(&s_flux_est);
-#if FEATURE_SMO
-    smo_reset(&s_smo);
-    pll_reset(&s_pll_smo);
-#endif
-#if FEATURE_MXLEMMING
-    mxl_reset(&s_mxl);
-#endif
-}
-
-static inline float counts_to_amps_cal(uint16_t raw, uint16_t offset)
-{
-    /* Negate: OA1/OA2 inverting topology on MCLV-48V-300W DIM.
-     * AN1292 reference uses (HALF_ADC_COUNT - ADC_DATA) for same reason. */
-    return -((float)(int16_t)(raw - offset)) * CURRENT_SCALE_A_PER_COUNT;
-}
-
-static inline float counts_to_vbus(uint16_t raw)
-{
-    return (float)raw * VBUS_SCALE_V_PER_COUNT;
-}
-#endif /* FEATURE_FOC */
-
-#if FEATURE_FOC_V2 || FEATURE_FOC_V3 || FEATURE_FOC_AN1078
-/* Reuse same helper for v2/v3/AN1078 telemetry raw→amps conversion */
-static inline float v2_counts_to_amps(uint16_t raw, uint16_t offset)
-{
-    return -((float)(int16_t)(raw - offset)) * CURRENT_SCALE_A_PER_COUNT;
-}
-#endif
-
-#if FEATURE_IF_STARTUP
-/* ── I-f current-controlled spin-up (Milestone 1) ────────────────────────────
- * Reuses the standalone FOC primitives (Clarke/Park/SVPWM/PI) to drive a
- * regulated current vector at a forced, ramping angle. Because SVPWM sets the
- * differential phase voltage, the effective drive goes BELOW MIN_DUTY — so the
- * motor spins up smoothly with Ibus bounded at ifCurrentCa (no 22A slam) and no
- * deadtime floor. M1 = align → ramp to IF_HANDOFF and HOLD (no 6-step handoff). */
-#include "foc/foc_types.h"
-#include "foc/clarke.h"
-#include "foc/park.h"
-#include "foc/svpwm.h"
-#include "foc/pi_controller.h"
-
-static PI_t     s_if_pid_d, s_if_pid_q;
-static float    s_if_theta;        /* forced electrical angle (rad) */
-static float    s_if_omega;        /* forced electrical speed (elec rad/s) */
-static uint16_t s_if_alignCtr;     /* ticks holding angle before the speed ramp */
-static bool     s_if_atHandoff;    /* reached IF_HANDOFF (telemetry/M2 trigger) */
-static bool     s_if_bridgeUp;     /* false until overrides released (after latch) */
-/* MON current-offset calibration. The fixed IF_ADC_MIDPOINT (2048) is wrong on
- * this board — the MON channels rest at ia~4085, ib~84 (ib is starved by the
- * 1MHz HWZC channels unless they're disabled). Sample the TRUE rest over
- * IF_CAL_TICKS at zero current and subtract that instead of 2048. */
-/* Phase-current offset calibration. With the CMP1/CMP2 root-cause fix
- * (hal_comparator.c — their input muxes railed OA1/OA2 in the 6-step build),
- * the op-amps should rest near 2048; the cal measures the TRUE rest anyway. */
-static float    s_if_ia_off, s_if_ib_off;
-static int32_t  s_if_ia_acc, s_if_ib_acc;
-static uint16_t s_if_calCtr;
-#define IF_CAL_TICKS  48u          /* ~2ms of zero-current rest sampling */
-
-/* Self-contained ADC conversions: the FEATURE_FOC counts_to_* helpers, the
- * calibrated current offset, AND garuda_foc_params.h itself are all compiled
- * out in the pure 6-step build, so define the scales here from the documented
- * shunt/divider values (shunt 3mΩ × OA gain 24.95, Vref 3.3, FS 4095, Vbus
- * divider 23.2). Fixed 2048 bias matches the 6-step convention; negation
- * matches the FOC sign convention the reused gains were tuned with. */
-#define IF_ADC_MIDPOINT   2048.0f
-#define IF_CURRENT_SCALE  (3.3f / (4095.0f * 0.003f * 24.95f))   /* A per count */
-#define IF_VBUS_SCALE     (3.3f * 23.2f / 4095.0f)               /* V per count */
-/* Sign for the MON phase-current channels. The 6-step path reads them as
- * (raw-2048) POSITIVE (no negation, unlike the FOC MAIN channels). Wrong sign
- * = positive feedback = runaway → voltage clamp → full-scale current spike.
- * Diagnostic proved the MON channels are INVERTING (like the FOC MAIN
- * channels): +vd produced -idmeas. So negate (-1), same as the FOC path. */
-#define IF_CURRENT_SIGN   (-1.0f)
-static inline float if_raw_to_amps(uint16_t raw)
-{
-    return IF_CURRENT_SIGN * ((float)raw - IF_ADC_MIDPOINT) * IF_CURRENT_SCALE;
-}
-static inline float if_raw_to_vbus(uint16_t raw)
-{
-    return (float)raw * IF_VBUS_SCALE;
-}
-
-static void IF_StartupInit(void)
-{
-    float vbus = if_raw_to_vbus(garudaData.vbusRaw);
-    if (vbus < 1.0f) vbus = 1.0f;
-    /* Clamp Vd/Vq. Cap at 3V for the first real-current run: plenty to spin to
-     * ~11k (BEMF there is ~1.5V) yet bounds a worst-case wrong-sign current
-     * (the firmware OC/UV tiers backstop). Raise toward vbus*0.95*IF_INV_SQRT3
-     * once confirmed stable. */
-    float vclamp = vbus * 0.95f * IF_INV_SQRT3;
-    if (vclamp > 3.0f) vclamp = 3.0f;
-    float kp = (float)gspParams.focKpDqMilli * 0.001f;  /* tuned for this motor */
-    float ki = (float)gspParams.focKiDq;
-    pi_init(&s_if_pid_d, kp, ki, -vclamp, vclamp);
-    pi_init(&s_if_pid_q, kp, ki, -vclamp, vclamp);
-    s_if_theta     = 0.0f;
-    s_if_omega     = 0.0f;
-    s_if_alignCtr  = 0;
-    s_if_atHandoff = false;
-    s_if_bridgeUp  = false;
-    /* Offset cal: seed with the nominal midpoint; refined in the cal window. */
-    s_if_ia_off = IF_ADC_MIDPOINT; s_if_ib_off = IF_ADC_MIDPOINT;
-    s_if_ia_acc = 0; s_if_ib_acc = 0; s_if_calCtr = 0;
-    /* ADC channels are FOC-configured from BOOT (hal_adc.c, before ADC ON):
-     * AD1CH0=OA1(ia), AD2CH0=OA2(ib); no 1MHz HWZC / MON channels in this
-     * build. Nothing to reconfigure here — the earlier runtime PINSEL swap
-     * (with ADON=1) is exactly what read OA2 as railed garbage. */
-#if FEATURE_SINE_STARTUP
-    garudaData.sine.active = false;     /* I-f owns the modulator now (only exists with sine) */
-#endif
-    /* Clean bring-up, part 1 (in this T1-ISR call): force override-LOW — undoes
-     * STARTUP_Init/SineInit's drive AND keeps the low-sides on so the bootstrap
-     * caps stay charged — then load BALANCED 0V duties into the buffer. We do
-     * NOT release the overrides here: doing so before the balanced duty has
-     * LATCHED makes the bridge briefly drive a stale/unbalanced duty → the UV
-     * glitch. Part 2 (first IF_StartupTick) releases them once latched. */
-    HAL_MC1PWMDisableOutputs();
-    HAL_PWM_SetDutyFloat3Phase(0.5f, 0.5f, 0.5f);
-}
-
-static void IF_StartupTick(uint16_t raw_ia, uint16_t raw_ib)
-{
-    /* Clean bring-up, part 2: on the first tick the balanced duty loaded in
-     * IF_StartupInit has now latched (≥1 PWM boundary elapsed since that T1
-     * call), so release the overrides — the bridge goes override-low → balanced
-     * 0V with no stale-duty transient. Hold balanced (skip the loop) this one
-     * tick so the released bridge settles at 0V before current is commanded. */
-    if (!s_if_bridgeUp) {
-        HAL_PWM_ReleaseAllOverrides();
-        HAL_PWM_SetDutyFloat3Phase(0.5f, 0.5f, 0.5f);
-        s_if_bridgeUp = true;
-        return;
-    }
-
-    /* Offset-cal window: hold balanced 0V (zero current) and average the op-amp
-     * rest values, so id/iq are measured against the TRUE offset. spi_zcs
-     * latches the measured ib offset — THE diagnostic for the CMP1/CMP2 fix:
-     * ~2048 = op-amps un-railed and healthy; ~60/84 = still railed. */
-    if (s_if_calCtr < IF_CAL_TICKS) {
-        HAL_PWM_SetDutyFloat3Phase(0.5f, 0.5f, 0.5f);
-        s_if_ia_acc += raw_ia;
-        s_if_ib_acc += raw_ib;
-        if (++s_if_calCtr >= IF_CAL_TICKS) {
-            s_if_ia_off = (float)s_if_ia_acc / (float)IF_CAL_TICKS;
-            s_if_ib_off = (float)s_if_ib_acc / (float)IF_CAL_TICKS;
-            garudaData.speedPi.zcsSinceEnable = (uint16_t)s_if_ib_off;
-        }
-        return;
-    }
-
-    float ia   = IF_CURRENT_SIGN * ((float)raw_ia - s_if_ia_off) * IF_CURRENT_SCALE;
-    float ib   = IF_CURRENT_SIGN * ((float)raw_ib - s_if_ib_off) * IF_CURRENT_SCALE;
-    float vbus = if_raw_to_vbus(garudaData.vbusRaw);
-    if (vbus < 1.0f) vbus = 1.0f;
-
-    /* measure: 3-phase → αβ → dq at the forced angle */
-    AlphaBeta_t iab;  clarke_transform(ia, ib, &iab);
-    DQ_t idq;         park_transform(&iab, s_if_theta, &idq);
-
-    /* regulate the current vector onto the forced d-axis (rotating field).
-     * Soft-start: ramp the current reference up over the align window so the
-     * rotor pulls into the forced frame gently (no step / no spike). */
-    float frac = (s_if_alignCtr < IF_ALIGN_TICKS)
-               ? ((float)s_if_alignCtr / (float)IF_ALIGN_TICKS) : 1.0f;
-    float id_ref = (float)RT_IF_CURRENT_CA * 0.01f * frac;
-    DQ_t vdq;
-    vdq.d = pi_update(&s_if_pid_d, id_ref - idq.d, IF_DT_S);
-    vdq.q = pi_update(&s_if_pid_q, 0.0f   - idq.q, IF_DT_S);
-
-    /* dq → αβ → SVPWM duties (centered; effective V can be < MIN_DUTY) */
-    AlphaBeta_t vab;  inv_park_transform(&vdq, s_if_theta, &vab);
-    float da, db, dc;
-    svpwm_update(vab.alpha, vab.beta, vbus, &da, &db, &dc);
-    HAL_PWM_SetDutyFloat3Phase(da, db, dc);
-
-    /* DIAG: spi_target=id_ref(mA), spi_error=id_meas(mA), spi_integ=vd(V),
-     * spi_output=omega(rad/s), spi_zcs=ib offset. */
-    garudaData.speedPi.lastTarget  = (uint32_t)(id_ref  * 1000.0f);
-    garudaData.speedPi.lastError   = (int32_t) (idq.d   * 1000.0f);
-    garudaData.speedPi.integratorF = vdq.d;
-    garudaData.speedPi.outputDuty  = (uint32_t)(s_if_omega);
-
-    /* align first (hold angle so the rotor settles), then ramp speed */
-    if (s_if_alignCtr < IF_ALIGN_TICKS) {
-        s_if_alignCtr++;
-    } else if (s_if_omega < IF_HANDOFF_RAD_S) {
-        float omega_dot = IF_ERPM_TO_RAD_S(RT_IF_RAMP_ERPM_PER_S);
-        s_if_omega += omega_dot * IF_DT_S;
-        if (s_if_omega >= IF_HANDOFF_RAD_S) {
-            s_if_omega     = IF_HANDOFF_RAD_S;
-            s_if_atHandoff = true;       /* M1: hold here; M2 will hand to 6-step */
-        }
-    }
-    s_if_theta += s_if_omega * IF_DT_S;
-    if (s_if_theta >  3.14159265f) s_if_theta -= 6.28318531f;
-    if (s_if_theta < -3.14159265f) s_if_theta += 6.28318531f;
-}
-#endif /* FEATURE_IF_STARTUP */
+//#if FEATURE_IF_STARTUP
+///* â”€â”€ I-f current-controlled spin-up (Milestone 1) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// * Reuses the standalone FOC primitives (Clarke/Park/SVPWM/PI) to drive a
+// * regulated current vector at a forced, ramping angle. Because SVPWM sets the
+// * differential phase voltage, the effective drive goes BELOW MIN_DUTY â€” so the
+// * motor spins up smoothly with Ibus bounded at ifCurrentCa (no 22A slam) and no
+// * deadtime floor. M1 = align â†’ ramp to IF_HANDOFF and HOLD (no 6-step handoff). */
+//
+//static PI_t     s_if_pid_d, s_if_pid_q;
+//static float    s_if_theta;        /* forced electrical angle (rad) */
+//static float    s_if_omega;        /* forced electrical speed (elec rad/s) */
+//static uint16_t s_if_alignCtr;     /* ticks holding angle before the speed ramp */
+//static bool     s_if_atHandoff;    /* reached IF_HANDOFF (telemetry/M2 trigger) */
+//static bool     s_if_bridgeUp;     /* false until overrides released (after latch) */
+///* MON current-offset calibration. The fixed IF_ADC_MIDPOINT (2048) is wrong on
+// * this board â€” the MON channels rest at ia~4085, ib~84 (ib is starved by the
+// * 1MHz HWZC channels unless they're disabled). Sample the TRUE rest over
+// * IF_CAL_TICKS at zero current and subtract that instead of 2048. */
+///* Phase-current offset calibration. With the CMP1/CMP2 root-cause fix
+// * (hal_comparator.c â€” their input muxes railed OA1/OA2 in the 6-step build),
+// * the op-amps should rest near 2048; the cal measures the TRUE rest anyway. */
+//static float    s_if_ia_off, s_if_ib_off;
+//static int32_t  s_if_ia_acc, s_if_ib_acc;
+//static uint16_t s_if_calCtr;
+//#define IF_CAL_TICKS  48u          /* ~2ms of zero-current rest sampling */
+//
+///* Self-contained ADC conversions for I-f spin-up: define the scales from the
+// * documented shunt/divider values (shunt 3mΩ × OA gain 24.95, Vref 3.3,
+// * FS 4095, Vbus divider 23.2). Fixed 2048 bias matches the 6-step convention. */
+//#define IF_ADC_MIDPOINT   2048.0f
+//#define IF_CURRENT_SCALE  (3.3f / (4095.0f * 0.003f * 24.95f))   /* A per count */
+//#define IF_VBUS_SCALE     (3.3f * 23.2f / 4095.0f)               /* V per count */
+///* Sign for the MON phase-current channels. The 6-step path reads them as
+// * (raw-2048) POSITIVE (no negation, unlike the FOC MAIN channels). Wrong sign
+// * = positive feedback = runaway â†’ voltage clamp â†’ full-scale current spike.
+// * Diagnostic proved the MON channels are INVERTING (like the FOC MAIN
+// * channels): +vd produced -idmeas. So negate (-1), same as the FOC path. */
+//#define IF_CURRENT_SIGN   (-1.0f)
+//static inline float if_raw_to_amps(uint16_t raw)
+//{
+//    return IF_CURRENT_SIGN * ((float)raw - IF_ADC_MIDPOINT) * IF_CURRENT_SCALE;
+//}
+//static inline float if_raw_to_vbus(uint16_t raw)
+//{
+//    return (float)raw * IF_VBUS_SCALE;
+//}
+//
+//static void IF_StartupInit(void)
+//{
+//    float vbus = if_raw_to_vbus(garudaData.vbusRaw);
+//    if (vbus < 1.0f) vbus = 1.0f;
+//    /* Clamp Vd/Vq. Cap at 3V for the first real-current run: plenty to spin to
+//     * ~11k (BEMF there is ~1.5V) yet bounds a worst-case wrong-sign current
+//     * (the firmware OC/UV tiers backstop). Raise toward vbus*0.95*IF_INV_SQRT3
+//     * once confirmed stable. */
+//    float vclamp = vbus * 0.95f * IF_INV_SQRT3;
+//    if (vclamp > 3.0f) vclamp = 3.0f;
+//    float kp = (float)gspParams.focKpDqMilli * 0.001f;  /* tuned for this motor */
+//    float ki = (float)gspParams.focKiDq;
+//    pi_init(&s_if_pid_d, kp, ki, -vclamp, vclamp);
+//    pi_init(&s_if_pid_q, kp, ki, -vclamp, vclamp);
+//    s_if_theta     = 0.0f;
+//    s_if_omega     = 0.0f;
+//    s_if_alignCtr  = 0;
+//    s_if_atHandoff = false;
+//    s_if_bridgeUp  = false;
+//    /* Offset cal: seed with the nominal midpoint; refined in the cal window. */
+//    s_if_ia_off = IF_ADC_MIDPOINT; s_if_ib_off = IF_ADC_MIDPOINT;
+//    s_if_ia_acc = 0; s_if_ib_acc = 0; s_if_calCtr = 0;
+//    /* ADC channels are FOC-configured from BOOT (hal_adc.c, before ADC ON):
+//     * AD1CH0=OA1(ia), AD2CH0=OA2(ib); no 1MHz HWZC / MON channels in this
+//     * build. Nothing to reconfigure here â€” the earlier runtime PINSEL swap
+//     * (with ADON=1) is exactly what read OA2 as railed garbage. */
+//#if FEATURE_SINE_STARTUP
+//    garudaData.sine.active = false;     /* I-f owns the modulator now (only exists with sine) */
+//#endif
+//    /* Clean bring-up, part 1 (in this T1-ISR call): force override-LOW â€” undoes
+//     * STARTUP_Init/SineInit's drive AND keeps the low-sides on so the bootstrap
+//     * caps stay charged â€” then load BALANCED 0V duties into the buffer. We do
+//     * NOT release the overrides here: doing so before the balanced duty has
+//     * LATCHED makes the bridge briefly drive a stale/unbalanced duty â†’ the UV
+//     * glitch. Part 2 (first IF_StartupTick) releases them once latched. */
+//    HAL_MC1PWMDisableOutputs();
+//    HAL_PWM_SetDutyFloat3Phase(0.5f, 0.5f, 0.5f);
+//}
+//
+//static void IF_StartupTick(uint16_t raw_ia, uint16_t raw_ib)
+//{
+//    /* Clean bring-up, part 2: on the first tick the balanced duty loaded in
+//     * IF_StartupInit has now latched (â‰¥1 PWM boundary elapsed since that T1
+//     * call), so release the overrides â€” the bridge goes override-low â†’ balanced
+//     * 0V with no stale-duty transient. Hold balanced (skip the loop) this one
+//     * tick so the released bridge settles at 0V before current is commanded. */
+//    if (!s_if_bridgeUp) {
+//        HAL_PWM_ReleaseAllOverrides();
+//        HAL_PWM_SetDutyFloat3Phase(0.5f, 0.5f, 0.5f);
+//        s_if_bridgeUp = true;
+//        return;
+//    }
+//
+//    /* Offset-cal window: hold balanced 0V (zero current) and average the op-amp
+//     * rest values, so id/iq are measured against the TRUE offset. spi_zcs
+//     * latches the measured ib offset â€” THE diagnostic for the CMP1/CMP2 fix:
+//     * ~2048 = op-amps un-railed and healthy; ~60/84 = still railed. */
+//    if (s_if_calCtr < IF_CAL_TICKS) {
+//        HAL_PWM_SetDutyFloat3Phase(0.5f, 0.5f, 0.5f);
+//        s_if_ia_acc += raw_ia;
+//        s_if_ib_acc += raw_ib;
+//        if (++s_if_calCtr >= IF_CAL_TICKS) {
+//            s_if_ia_off = (float)s_if_ia_acc / (float)IF_CAL_TICKS;
+//            s_if_ib_off = (float)s_if_ib_acc / (float)IF_CAL_TICKS;
+//            garudaData.speedPi.zcsSinceEnable = (uint16_t)s_if_ib_off;
+//        }
+//        return;
+//    }
+//
+//    float ia   = IF_CURRENT_SIGN * ((float)raw_ia - s_if_ia_off) * IF_CURRENT_SCALE;
+//    float ib   = IF_CURRENT_SIGN * ((float)raw_ib - s_if_ib_off) * IF_CURRENT_SCALE;
+//    float vbus = if_raw_to_vbus(garudaData.vbusRaw);
+//    if (vbus < 1.0f) vbus = 1.0f;
+//
+//    /* measure: 3-phase â†’ Î±Î² â†’ dq at the forced angle */
+//    AlphaBeta_t iab;  clarke_transform(ia, ib, &iab);
+//    DQ_t idq;         park_transform(&iab, s_if_theta, &idq);
+//
+//    /* regulate the current vector onto the forced d-axis (rotating field).
+//     * Soft-start: ramp the current reference up over the align window so the
+//     * rotor pulls into the forced frame gently (no step / no spike). */
+//    float frac = (s_if_alignCtr < IF_ALIGN_TICKS)
+//               ? ((float)s_if_alignCtr / (float)IF_ALIGN_TICKS) : 1.0f;
+//    float id_ref = (float)RT_IF_CURRENT_CA * 0.01f * frac;
+//    DQ_t vdq;
+//    vdq.d = pi_update(&s_if_pid_d, id_ref - idq.d, IF_DT_S);
+//    vdq.q = pi_update(&s_if_pid_q, 0.0f   - idq.q, IF_DT_S);
+//
+//    /* dq â†’ Î±Î² â†’ SVPWM duties (centered; effective V can be < MIN_DUTY) */
+//    AlphaBeta_t vab;  inv_park_transform(&vdq, s_if_theta, &vab);
+//    float da, db, dc;
+//    svpwm_update(vab.alpha, vab.beta, vbus, &da, &db, &dc);
+//    HAL_PWM_SetDutyFloat3Phase(da, db, dc);
+//
+//    /* DIAG: spi_target=id_ref(mA), spi_error=id_meas(mA), spi_integ=vd(V),
+//     * spi_output=omega(rad/s), spi_zcs=ib offset. */
+//    garudaData.speedPi.lastTarget  = (uint32_t)(id_ref  * 1000.0f);
+//    garudaData.speedPi.lastError   = (int32_t) (idq.d   * 1000.0f);
+//    garudaData.speedPi.integratorF = vdq.d;
+//    garudaData.speedPi.outputDuty  = (uint32_t)(s_if_omega);
+//
+//    /* align first (hold angle so the rotor settles), then ramp speed */
+//    if (s_if_alignCtr < IF_ALIGN_TICKS) {
+//        s_if_alignCtr++;
+//    } else if (s_if_omega < IF_HANDOFF_RAD_S) {
+//        float omega_dot = IF_ERPM_TO_RAD_S(RT_IF_RAMP_ERPM_PER_S);
+//        s_if_omega += omega_dot * IF_DT_S;
+//        if (s_if_omega >= IF_HANDOFF_RAD_S) {
+//            s_if_omega     = IF_HANDOFF_RAD_S;
+//            s_if_atHandoff = true;       /* M1: hold here; M2 will hand to 6-step */
+//        }
+//    }
+//    s_if_theta += s_if_omega * IF_DT_S;
+//    if (s_if_theta >  3.14159265f) s_if_theta -= 6.28318531f;
+//    if (s_if_theta < -3.14159265f) s_if_theta += 6.28318531f;
+//}
+//#endif /* FEATURE_IF_STARTUP */
 
 #if FEATURE_IBUS_PROBE
 /* PROBE: count of CMP3 rising-edge fires latched via _CMP3IF (set per cycle,
@@ -482,30 +231,30 @@ volatile uint32_t g_cmp3FireCount = 0;
 #endif
 
 #if FEATURE_CL_DIFF_IDLE || FEATURE_CL_COAST_VERIFY
-/* ── Coast-listen lock acquisition (2026-06-10) ──────────────────────────
+/* â”€â”€ Coast-listen lock acquisition (2026-06-10) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
  * At CL entry, instead of trusting the morph's lock (bench: the morph can
- * drag a SLIPPING rotor while its gate claims 3k lock — coast-listen caught
+ * drag a SLIPPING rotor while its gate claims 3k lock â€” coast-listen caught
  * it at ~900 real), CUT THE BRIDGE for up to ~2 electrical cycles and listen
- * to phase B's clean BEMF — no PWM means no threshold model at all. The
+ * to phase B's clean BEMF â€” no PWM means no threshold model at all. The
  * median of the crossing intervals is the true period (one B-crossing every
  * half e-cycle = 3 sector periods); the last crossing's polarity gives the
  * sector exactly (B floats rising in step 2, falling in step 5; ZC = sector
- * center). Engage SYNCED at the crossing instant — differential drive when
+ * center). Engage SYNCED at the crossing instant â€” differential drive when
  * FEATURE_CL_DIFF_IDLE, the conventional waveform otherwise (verify mode).
  * Same primitive AM32/BLHeli use to catch a spinning motor. Windage decel
  * over the window is negligible (morph coast measurements). The first ~3ms
- * after bridge-cut freewheel through the body diodes and ring the phases —
- * settle past it and reject impossible intervals. direction!=0 → no coast. */
+ * after bridge-cut freewheel through the body diodes and ring the phases â€”
+ * settle past it and reject impossible intervals. direction!=0 â†’ no coast. */
 #define CL_COAST_MIN_CROSS      3     /* crossings needed (=> 2 valid intervals) */
 #define CL_COAST_MAX_IV         4     /* intervals stored for the median */
-#define CL_COAST_TIMEOUT_TICKS  4500  /* ~100ms @45kHz — then blind fallback engage */
+#define CL_COAST_TIMEOUT_TICKS  4500  /* ~100ms @45kHz â€” then blind fallback engage */
 #define CL_COAST_SETTLE_TICKS   150   /* ~3.3ms: at bridge-cut the winding current
                                        * FREEWHEELS through the body diodes, slamming
-                                       * the phase to the rails — ring-crossings.
+                                       * the phase to the rails â€” ring-crossings.
                                        * (Bench 2026-06-10: 12-tick settle let a
                                        * synced-morph cut measure HALF the true
-                                       * interval → 2× engage → +22A OC.) */
-#define CL_COAST_IV_MIN         150   /* reject intervals implying > ~9k eRPM —
+                                       * interval â†’ 2Ã— engage â†’ +22A OC.) */
+#define CL_COAST_IV_MIN         150   /* reject intervals implying > ~9k eRPM â€”
                                        * impossible coming from the ~3k morph;
                                        * those are ringing/noise, not BEMF */
 #define CL_COAST_HYST           8     /* ADC counts hysteresis about the mean */
@@ -548,13 +297,13 @@ static void CL_CoastBegin(void)
 }
 
 /* Re-engage drive at `sector`, period `p`, next commutation in `dl` ticks,
- * marked synced. Mirrors the morph→CL exit seeding. */
+ * marked synced. Mirrors the morphâ†’CL exit seeding. */
 static void CL_CoastEngage(uint8_t sector, uint16_t p, uint16_t dl, uint16_t now)
 {
 #if FEATURE_CL_ENTRY_GLIDE
     /* Glide engage: diff waveform at effective volts MATCHED to the measured
-     * speed (duty = MIN_DUTY × erpm / equilibrium-erpm) — torque step at
-     * engage ≈ 0, then the per-tick glide ramps duty to MIN_DUTY. */
+     * speed (duty = MIN_DUTY Ã— erpm / equilibrium-erpm) â€” torque step at
+     * engage â‰ˆ 0, then the per-tick glide ramps duty to MIN_DUTY. */
     {
         uint32_t erpm = ERPM_FROM_ADC_STEP_NUM / p;
         uint32_t d = ((uint32_t)MIN_DUTY * erpm) / CL_GLIDE_EQ_ERPM;
@@ -572,13 +321,13 @@ static void CL_CoastEngage(uint8_t sector, uint16_t p, uint16_t dl, uint16_t now
     g_pwmDiffLow = 1;
     COMMUTATION_ApplyStep(&garudaData, sector);
     /* Engage GENTLY at the idle floor: the rotor is already at speed and only
-     * needs holding volts. (Engaging at MIN_DUTY — which the deadtime comp
-     * turns into a ~16% active pulse — caused a −21A blip at engage.) */
+     * needs holding volts. (Engaging at MIN_DUTY â€” which the deadtime comp
+     * turns into a ~16% active pulse â€” caused a âˆ’21A blip at engage.) */
     garudaData.duty = CL_DIFF_IDLE_FLOOR;
     HAL_PWM_SetDutyCycle(garudaData.duty);
 #else
     /* Verify mode: conventional waveform, same entry duty the morph coast
-     * used (MIN_DUTY) — identical volts to today's hot hand-off, but at the
+     * used (MIN_DUTY) â€” identical volts to today's hot hand-off, but at the
      * MEASURED sector and period instead of the morph's possibly-fictional
      * lock state. */
     COMMUTATION_ApplyStep(&garudaData, sector);
@@ -636,14 +385,14 @@ static bool CL_CoastListenTick(uint16_t vB, uint16_t now)
                 uint16_t ivNow =
                     (uint16_t)(s_clCoast.tick - s_clCoast.lastCrossTick);
                 /* Plausibility: too-short intervals are diode-ring/noise,
-                 * not BEMF — discard (the timer still re-anchors below, so
+                 * not BEMF â€” discard (the timer still re-anchors below, so
                  * a later clean crossing measures from the last event). */
                 if (ivNow >= CL_COAST_IV_MIN)
                 {
                     if (s_clCoast.nIv >= CL_COAST_MAX_IV)
                     {
                         /* Sliding window: early intervals can be mean-bias
-                         * artifacts — keep the most recent ones. */
+                         * artifacts â€” keep the most recent ones. */
                         uint8_t i;
                         for (i = 1; i < CL_COAST_MAX_IV; i++)
                             s_clCoast.iv[i - 1u] = s_clCoast.iv[i];
@@ -659,14 +408,14 @@ static bool CL_CoastListenTick(uint16_t vB, uint16_t now)
             {
                 /* CONSISTENCY GATE (2026-06-10): while the running mean is
                  * still biased early in the coast, it crosses the BEMF
-                 * asymmetrically — ALTERNATING short/long intervals (bench:
+                 * asymmetrically â€” ALTERNATING short/long intervals (bench:
                  * the post-sine bridge-cut measured a deterministic 79-tick
-                 * period = "5696 eRPM" from a 3k rotor, impossible — all six
+                 * period = "5696 eRPM" from a 3k rotor, impossible â€” all six
                  * runs identical). True BEMF crossings of a converged mean
                  * are uniform. Require the last 3 intervals to agree within
-                 * 25% before trusting them; inconsistent → keep listening
+                 * 25% before trusting them; inconsistent â†’ keep listening
                  * (the mean converges, later intervals become uniform);
-                 * never consistent → timeout fallback (pre-coast behavior). */
+                 * never consistent â†’ timeout fallback (pre-coast behavior). */
                 uint16_t a = s_clCoast.iv[s_clCoast.nIv - 3u];
                 uint16_t b = s_clCoast.iv[s_clCoast.nIv - 2u];
                 uint16_t c = s_clCoast.iv[s_clCoast.nIv - 1u];
@@ -686,7 +435,7 @@ static bool CL_CoastListenTick(uint16_t vB, uint16_t now)
                     /* Sector from polarity: B floats rising in step 2, falling
                      * in step 5; the crossing IS the sector center, so the next
                      * commutation is half a period out. Engaging at the
-                     * crossing instant keeps the angle error ≤ one tick. */
+                     * crossing instant keeps the angle error â‰¤ one tick. */
                     uint8_t k = s_clCoast.lastRising ? 2u : 5u;
                     CL_CoastEngage(k, p, (uint16_t)(p / 2u), now);
                     return true;
@@ -695,7 +444,7 @@ static bool CL_CoastListenTick(uint16_t vB, uint16_t now)
         }
     }
 
-    /* Timeout — couldn't hear enough crossings (too slow / too quiet):
+    /* Timeout â€” couldn't hear enough crossings (too slow / too quiet):
      * blind fallback = the pre-coast behavior (morph-seeded period). */
     if (s_clCoast.tick >= CL_COAST_TIMEOUT_TICKS)
         CL_CoastEngage(garudaData.currentStep,
@@ -708,12 +457,12 @@ static bool CL_CoastListenTick(uint16_t vB, uint16_t now)
 #if FEATURE_OC_AUTOZERO
 /* OC auto-zero (2026-06-10): measured bus-ADC rest bias. 2048 = uncalibrated
  * (legacy behavior). Measured during ARMED with the bridge off; re-measured on
- * every disarm→arm. Shared with hal_comparator.c (CMP3 DAC shift). */
+ * every disarmâ†’arm. Shared with hal_comparator.c (CMP3 DAC shift). */
 volatile uint16_t g_ocBiasAdc = 2048;
 static uint16_t s_ocZeroRaw;       /* last UNCORRECTED bus sample (cal input) */
 static uint32_t s_ocZeroAcc;
 static uint16_t s_ocZeroCount;
-static uint16_t s_ocZeroMin;       /* window spread — quiescence gate */
+static uint16_t s_ocZeroMin;       /* window spread â€” quiescence gate */
 static uint16_t s_ocZeroMax;
 #endif
 
@@ -723,7 +472,7 @@ static uint16_t heartbeatCounter = 0;
 static uint8_t msSubCounter = 0;
 
 #if FEATURE_BEMF_CLOSED_LOOP
-/* File-scope statics for ZC — only accessed from ADC ISR, NOT Timer1 ISR */
+/* File-scope statics for ZC â€” only accessed from ADC ISR, NOT Timer1 ISR */
 static uint16_t adcIsrTick = 0;
 static ESC_STATE_T prevAdcState = ESC_IDLE;
 
@@ -766,8 +515,7 @@ void GARUDA_ServiceInit(void)
     garudaData.desyncRestartAttempts = 0;
     garudaData.recoveryCounter = 0;
 
-#if !FEATURE_FOC && !FEATURE_FOC_V2 && !FEATURE_FOC_V3 && !FEATURE_FOC_AN1078
-    /* Phase-current monitor — start with empty max/min. iaMin initialized
+    /* Phase-current monitor â€” start with empty max/min. iaMin initialized
      * to 0xFFFF so the first real sample wins the "less than" comparison. */
     garudaData.phaseCurrent.iaRaw = 0;
     garudaData.phaseCurrent.ibRaw = 0;
@@ -787,56 +535,8 @@ void GARUDA_ServiceInit(void)
     garudaData.phaseCurrent.ibusMaxAtFault = 0;
     garudaData.phaseCurrent.ibusMinAtFault = 0;
     garudaData.phaseCurrent.faultCaptured = 0;
-#endif
 
-#if FEATURE_FOC
-    /* FOC algorithm state */
-    pi_init(&s_pid_d,   KP_DQ,  KI_DQ,  -CLAMP_VDQ,       CLAMP_VDQ);
-    pi_init(&s_pid_q,   KP_DQ,  KI_DQ,  -CLAMP_VDQ,       CLAMP_VDQ);
-    pi_init(&s_pid_spd, KP_SPD, KI_SPD, -CLAMP_IQ_REF_A,  CLAMP_IQ_REF_A);
-    bemf_obs_reset(&s_obs);
-    pll_reset(&s_pll);
-    flux_est_reset(&s_flux_est);
-#if FEATURE_SMO
-    smo_reset(&s_smo);
-    pll_reset(&s_pll_smo);
-#endif
-#if FEATURE_MXLEMMING
-    mxl_reset(&s_mxl);
-#endif
-    foc_startup_reset();
-    s_iq_ref    = 0.0f;
-    s_vbus      = MOTOR_VBUS_NOM_V;
-    s_slow_ctr  = 0;
-    s_stall_ctr = 0;
-    s_ia_accum  = 0;
-    s_ib_accum  = 0;
-    s_cal_count = 0;
-    s_ia_offset = ADC_MIDPOINT;
-    s_ib_offset = ADC_MIDPOINT;
-    s_cal_done  = false;
-#endif
-
-#if FEATURE_FOC_V2
-    {
-        FOC_MotorParams_t mp = BuildFocMotorParams();
-        foc_v2_init(&s_foc_v2, &mp);
-        gspFocReinitNeeded = false;
-    }
-#elif FEATURE_FOC_V3
-    {
-        FOC_MotorParams_t mp = BuildFocMotorParams();
-        foc_v3_init(&s_foc_v3, &mp);
-        gspFocReinitNeeded = false;
-    }
-#elif FEATURE_FOC_AN1078
-    {
-        AN_MotorInit(&s_foc_an);
-        gspFocReinitNeeded = false;
-    }
-#endif
-
-    /* Throttle source init — unconditional (Finding 42/54).
+    /* Throttle source init â€” unconditional (Finding 42/54).
      * Priority: ADC_POT > RX_AUTO > RX_PWM > RX_DSHOT > GSP */
 #if FEATURE_ADC_POT
     garudaData.throttleSource = THROTTLE_SRC_ADC;
@@ -943,28 +643,22 @@ void GARUDA_ServiceInit(void)
 }
 
 /**
- * @brief ADC ISR — runs at PWM rate (24kHz).
+ * @brief ADC ISR â€” runs at PWM rate (24kHz).
  * Reads BEMF/Vbus, runs state machine, updates PWM.
  * Phase 2: sole commutation owner for CLOSED_LOOP state
  * (bypassed when DIAGNOSTIC_MANUAL_STEP=1).
  */
 void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
 {
-    /* Read all ADC buffers. MUST read AD1CH0DATA first — interrupt source.
+    /* Read all ADC buffers. MUST read AD1CH0DATA first â€” interrupt source.
      * Reading clears data-ready condition on dsPIC33AK. */
-#if FEATURE_FOC || FEATURE_FOC_V2 || FEATURE_FOC_V3 || FEATURE_FOC_AN1078
-    /* FOC: AD1CH0 = Ia (OA1OUT), AD2CH0 = Ib (OA2OUT) — raw uint16_t */
-    uint16_t raw_ia = ADCBUF_IA;
-    uint16_t raw_ib = ADCBUF_IB;
-#else
     /* 6-step: AD1CH0 = Phase B voltage (RB8), AD2CH0 = Phase A/C (muxed) */
     uint16_t phaseB_val = ADCBUF_PHASE_B;
     uint16_t phaseAC_val = ADCBUF_PHASE_AC;
-#endif
     garudaData.vbusRaw = ADCBUF_VBUS;
     garudaData.potRaw = ADCBUF_POT;
 
-    /* Throttle source mux — unconditional switch (Finding 53/56) */
+    /* Throttle source mux â€” unconditional switch (Finding 53/56) */
     switch (garudaData.throttleSource) {
 #if FEATURE_GSP
         case THROTTLE_SRC_GSP:
@@ -984,7 +678,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
             break;
 #endif
         default:
-            /* Safety fallback — zero throttle for corrupted enum or disabled source.
+            /* Safety fallback â€” zero throttle for corrupted enum or disabled source.
              * Never reads floating ADC. (Finding 56) */
             garudaData.throttle = 0;
             break;
@@ -992,15 +686,15 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
 
 #if FEATURE_BEMF_CLOSED_LOOP
     /* Capture entry state for transition detection. Must be saved before
-     * any state changes (morph→CL etc.) so the NEXT tick sees the transition. */
+     * any state changes (morphâ†’CL etc.) so the NEXT tick sees the transition. */
     ESC_STATE_T entryState = garudaData.state;
 
     /* P1 DISABLED: Phase B rail-based measuredNeutral gives correct Phase B
      * midpoint (24 at low duty) but is 30% lower than the duty-proportional
      * value (34). Since HWZC uses zcThreshold directly (hwzc.c:169) for its
      * ADC comparator, the lower threshold pushes the comparator near the noise
-     * floor → massive noise rejections (NW6: 75k rejects vs NW4: 20k) →
-     * HWZC miss rate 26.7% → latch-off → software ZC fallback → failure.
+     * floor â†’ massive noise rejections (NW6: 75k rejects vs NW4: 20k) â†’
+     * HWZC miss rate 26.7% â†’ latch-off â†’ software ZC fallback â†’ failure.
      *
      * Phase B tracking still runs for diagnostic visibility in watch data. */
     if (garudaData.state == ESC_CLOSED_LOOP
@@ -1034,27 +728,27 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
                 garudaData.bemf.neutralValid = true;
             }
         }
-        /* Steps 2,5: B=FLOAT — no update, use cached measuredNeutral */
+        /* Steps 2,5: B=FLOAT â€” no update, use cached measuredNeutral */
     }
 
     /* ZC threshold: duty-proportional (P0) with symmetric IIR (P3).
      * P0: Exact division replaces >>18 shift (+1.7% bias fix).
-     * P1 measured neutral disabled — see comment above. */
+     * P1 measured neutral disabled â€” see comment above. */
     static uint16_t zcThreshSmooth = 0;
     {
-        /* P0: Duty-proportional threshold — always used.
+        /* P0: Duty-proportional threshold â€” always used.
          * Exact division replaces >>18 shift (+1.7% bias fix). */
 #if FEATURE_CL_DIFF_IDLE
         /* Differential-low CL: BOTH driven phases carry the MIN_DUTY base
          * pulse (active = duty+MIN_DUTY, low = MIN_DUTY), so the float's
-         * ON-center level — what this duty-proportional model tracks — is
-         * raised by 2×MIN_DUTY. Bench 2026-06-10: at duty=2.2% the float swung
+         * ON-center level â€” what this duty-proportional model tracks â€” is
+         * raised by 2Ã—MIN_DUTY. Bench 2026-06-10: at duty=2.2% the float swung
          * 47..136 while a flat-floored threshold (35) sat BELOW the whole
-         * swing → zero ZC confirms → frozen pre-sync → OC. Midpoint model
-         * (duty+2×MIN_DUTY → thr≈84) centers the threshold in that swing. */
+         * swing â†’ zero ZC confirms â†’ frozen pre-sync â†’ OC. Midpoint model
+         * (duty+2Ã—MIN_DUTY â†’ thrâ‰ˆ84) centers the threshold in that swing. */
         uint32_t thrDuty = garudaData.duty;
-        if (g_pwmDiffLow) thrDuty += 3u * MIN_DUTY;   /* active=duty+2·MIN(+DT comp),
-                                                       * low=MIN → midpoint duty/2+1.5·MIN */
+        if (g_pwmDiffLow) thrDuty += 3u * MIN_DUTY;   /* active=duty+2Â·MIN(+DT comp),
+                                                       * low=MIN â†’ midpoint duty/2+1.5Â·MIN */
         uint16_t rawThresh = (uint16_t)(
             ((uint32_t)garudaData.vbusRaw * thrDuty) / ZC_DUTY_DIVISOR);
 #else
@@ -1098,7 +792,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
             {
                 zcThreshSmooth = rawThresh;
 
-                /* P1: Reset measured neutral on CL entry — start fresh each run */
+                /* P1: Reset measured neutral on CL entry â€” start fresh each run */
                 garudaData.bemf.neutralValid = false;
                 garudaData.bemf.phaseBHighValid = false;
                 garudaData.bemf.phaseBLowValid = false;
@@ -1109,7 +803,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
                 garudaData.bemf.zcNeutralCount[2] = 0;
             }
 #if FEATURE_SINE_STARTUP
-            /* Guardrail #7: only consume in windowed context — stale flag
+            /* Guardrail #7: only consume in windowed context â€” stale flag
              * from a prior run can't accidentally reseed during normal CL. */
             else if (garudaData.morph.forceThreshSeed
                      && garudaData.state == ESC_MORPH
@@ -1121,7 +815,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
 #endif
             else
             {
-                /* P3: Symmetric IIR — 1/4 gain both directions, tau ~4 ticks = 0.17ms.
+                /* P3: Symmetric IIR â€” 1/4 gain both directions, tau ~4 ticks = 0.17ms.
                  * Replaces asymmetric (fast rise 0.33ms, slow fall 10.7ms) that
                  * caused threshold lag during deceleration. */
                 int16_t delta = (int16_t)rawThresh - (int16_t)zcThreshSmooth;
@@ -1137,7 +831,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
 
 #if HWZC_THRESH_BIAS_DOWN
         /* TEMP (VEX/1407 @10V): pull the published detection threshold DOWN by a
-         * fixed bias toward the true neutral. Applied to the OUTPUT only — the IIR
+         * fixed bias toward the true neutral. Applied to the OUTPUT only â€” the IIR
          * state (zcThreshSmooth) stays unbiased so the bias doesn't compound. */
         garudaData.bemf.zcThreshold =
             (garudaData.bemf.zcThreshold > HWZC_THRESH_BIAS_DOWN)
@@ -1193,12 +887,12 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
 #if FEATURE_ADC_CMP_ZC
         /* Live CMPLO refresh while HWZC is actively watching for a crossing.
          * Without this, CMPLO is only written at OnCommutation, so it stays
-         * stale for up to one sector period (~91 µs at 100k eRPM, much longer
+         * stale for up to one sector period (~91 Âµs at 100k eRPM, much longer
          * at low speed). Updating every 24 kHz tick tracks Vbus sag and duty
          * ramp mid-sector, which matters under load / during pot slew.
          *
          * Safety:
-         *   - Gated on HWZC_WATCHING — during BLANKING/COMM_PENDING the
+         *   - Gated on HWZC_WATCHING â€” during BLANKING/COMM_PENDING the
          *     comparator IE is disabled anyway.
          *   - CMPLO write is atomic (single 32-bit SFR).
          *   - CMPMOD is left untouched (set per-commutation in OnCommutation).
@@ -1210,7 +904,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
             int8_t pol = commutationTable[garudaData.currentStep].zcPolarity;
             uint16_t t = garudaData.bemf.zcThreshold;
             /* Filter-lag pre-distortion mirrors what HWZC_OnCommutation applied
-             * — keep the live refresh in lockstep so CMPLO stays compensated
+             * â€” keep the live refresh in lockstep so CMPLO stays compensated
              * as zcThreshold drifts with Vbus/duty mid-sector. */
             t = HWZC_ApplyFilterComp(&garudaData, t, (pol > 0));
             if (pol > 0)
@@ -1265,7 +959,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
 #if FEATURE_ADC_CMP_ZC
         /* Diagnostic: falling-sector OFF-center BEMF envelope. Capture bemfRaw
          * (OFF-center floating sample) only while a FALLING sector is in the
-         * WATCHING window — proves whether the falling crossing is visible at
+         * WATCHING window â€” proves whether the falling crossing is visible at
          * OFF-center (envelope brackets zcThreshold) vs the silent ON-time
          * comparator. Cheap: 2 compares per tick, diagnostic only. */
         if (garudaData.hwzc.enabled
@@ -1282,16 +976,16 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
              * the ON-time comparator but present here at OFF-center. Detect the
              * downward crossing of zcThreshold (one accept per sector) and record
              * it into the sector-PI path exactly as the HW comparator does
-             * (hwzc.c:549) — OnPiPeriodExpired then uses it. Plausibility floor:
+             * (hwzc.c:549) â€” OnPiPeriodExpired then uses it. Plausibility floor:
              * only past 1/4 of the period (the falling ZC sits ~mid-sector;
              * rejects early demag dips). Optional speed cap for coarse-resolution
              * top end. */
             if (!garudaData.hwzc.captureValid)
             {
-                /* RC-lag compensation, falling branch (added 2026-06-07) — the
+                /* RC-lag compensation, falling branch (added 2026-06-07) â€” the
                  * HW rising path applies this (hwzc.c:251 / live refresh :726)
                  * but the falling SW path historically didn't, so falling drifted
-                 * late vs rising as ω·τ grew. Apply the same per-polarity offset
+                 * late vs rising as Ï‰Â·Ï„ grew. Apply the same per-polarity offset
                  * (falling: thresh + offset) then the falling deadband, so both
                  * polarities are phase-consistent. Magnitude tunes via
                  * HWZC_FILTER_AMP_PCT_FALLING. */
@@ -1373,11 +1067,10 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
     /* Software HWZC path: run the ZC compare on the just-captured mid-ON
      * sample. Mid-ON sampling (PG1TRIGA valley) avoids the ~48 kHz phantom
      * rate the HW digital comparator sees on this board (5.5 kHz RC filter
-     * can't smooth 24 kHz PWM → ripple crosses threshold every cycle). */
+     * can't smooth 24 kHz PWM â†’ ripple crosses threshold every cycle). */
     HWZC_OnSoftwareSample(&garudaData);
 #endif
 
-#if !FEATURE_FOC && !FEATURE_FOC_V2 && !FEATURE_FOC_V3 && !FEATURE_FOC_AN1078
     /* Phase-current peak tracking (diagnostic). AD1CH3 / AD2CH2 convert at
      * 24 kHz (PG1TRIGA, mid-ON valley). max/min are the per-sample window
      * peaks; they're reset after each GSP snapshot read (see gsp_snapshot.c).
@@ -1407,7 +1100,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
         if (ib > garudaData.phaseCurrent.ibMax) garudaData.phaseCurrent.ibMax = ib;
         if (ib < garudaData.phaseCurrent.ibMin) garudaData.phaseCurrent.ibMin = ib;
 
-        /* Bus-current window tracking — uses the existing garudaData.ibusRaw
+        /* Bus-current window tracking â€” uses the existing garudaData.ibusRaw
          * which is captured later in this ISR, but at this point still holds
          * the PREVIOUS ISR's value (which is fine for window-aggregating). */
 #if FEATURE_HW_OVERCURRENT
@@ -1440,21 +1133,21 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
         /* Stream 6-step diagnostic channels into burst scope ring (24 kHz).
          *
          * Reuses the FOC-oriented SCOPE_SAMPLE_T fields:
-         *   ia  = Phase A current (OA1 → AD1CH3) in mA     [accurate]
-         *   ib  = Phase B current (OA2 → AD2CH2) in mA     [broken on this
-         *         MCLV+EV68M17A combo — reads ~0; kept as sanity channel]
+         *   ia  = Phase A current (OA1 â†’ AD1CH3) in mA     [accurate]
+         *   ib  = Phase B current (OA2 â†’ AD2CH2) in mA     [broken on this
+         *         MCLV+EV68M17A combo â€” reads ~0; kept as sanity channel]
          *   id  = Bus current (OA3/M1_IBUS_FILT) in mA     [REPURPOSED
          *         for 6-step; what U25B actually trips on]
          *   vd  = Vbus in centivolts (raw/10, approx)
          *   vq  = zcThreshold raw
          *   theta = currentStep (sector 0-5)
          *   omega = eRPM / 10 (fits int16 up to 327 kRPM)
-         *   mod_index = dutyPct × 100 (0-10000)
+         *   mod_index = dutyPct Ã— 100 (0-10000)
          *   flags:  bit0=HWZC enabled, bit1=fault
          *   state:  garudaData.state
          *
          * Scale (shared with phase-current monitor): ~93 ADC counts/A, bias 2048.
-         * mA = (raw - 2048) × 1000 / 93. Clamped to int16 range.
+         * mA = (raw - 2048) Ã— 1000 / 93. Clamped to int16 range.
          */
         {
             SCOPE_SAMPLE_T ss;
@@ -1505,12 +1198,9 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
         }
 #endif /* FEATURE_BURST_SCOPE */
     }
-#endif
 #else
-#if !FEATURE_FOC && !FEATURE_FOC_V2 && !FEATURE_FOC_V3 && !FEATURE_FOC_AN1078
     garudaData.bemf.bemfRaw = phaseB_val;
     (void)phaseAC_val;  /* AD2CH0DATA must be read; suppress unused warning */
-#endif
 #endif
 
     /* Bus voltage fault enforcement (OV/UV) */
@@ -1587,11 +1277,11 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
     /* Bus current sensing and overcurrent protection */
 #if FEATURE_HW_OVERCURRENT
 #if FEATURE_OC_AUTOZERO
-    /* Read AD1CH2DATA — clears data-ready (mandatory on dsPIC33AK) — then
+    /* Read AD1CH2DATA â€” clears data-ready (mandatory on dsPIC33AK) â€” then
      * re-center into the 2048 frame that every threshold, the window tracker
      * and the host decoder assume. The chain's TRUE rest is ~78 counts, so
-     * the correction is ≈ +1970 (no-op until the ARMED cal measures it).
-     * Saturates at 4095 ≈ +22A — beyond that is CMP3 hardware territory. */
+     * the correction is â‰ˆ +1970 (no-op until the ARMED cal measures it).
+     * Saturates at 4095 â‰ˆ +22A â€” beyond that is CMP3 hardware territory. */
     {
         uint16_t rawBus = ADCBUF_IBUS;
         s_ocZeroRaw = rawBus;                       /* for the ARMED cal */
@@ -1608,7 +1298,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
         garudaData.ibusRaw = (uint16_t)corr;
     }
 #else
-    /* Read AD1CH2DATA — clears data-ready (mandatory on dsPIC33AK) */
+    /* Read AD1CH2DATA â€” clears data-ready (mandatory on dsPIC33AK) */
     garudaData.ibusRaw = ADCBUF_IBUS;
 #endif
 
@@ -1626,7 +1316,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
     }
 
     /* Count CLPCI activity via CLEVT latched event flags.
-     * Poll all 3 generators — active PWM phase rotates with commutation.
+     * Poll all 3 generators â€” active PWM phase rotates with commutation.
      * Coarse counter: one 41.7us ADC tick may collapse multiple chop events. */
 #if (OC_PROTECT_MODE == 0 || OC_PROTECT_MODE == 2) && OC_CLPCI_ENABLE
     if (PCI_CLIMIT_EVT_PG1 || PCI_CLIMIT_EVT_PG2 || PCI_CLIMIT_EVT_PG3)
@@ -1642,7 +1332,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
 
 #if FEATURE_IBUS_PROBE
     /* Live CMP3 output LEVEL. With the probe DAC forced below the OA3 rest, this
-     * should read 1 continuously if CMP3 is wired to OA3 — independent of motor
+     * should read 1 continuously if CMP3 is wired to OA3 â€” independent of motor
      * current or the freewheel sample point. 0 = comparator blind to OA3. */
     g_cmp3FireCount = (uint32_t)DAC3CMPbits.CMPSTAT;
 #endif
@@ -1650,7 +1340,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
 #ifdef ENABLE_PWM_FAULT_PCI
     /* Count transient FPCI trips via FLTEVT latched event flags.
      * With TERM=1 (auto-terminate), board FPCI trips that resolve within
-     * one PWM cycle never set FLTACT by the time the ISR runs — but
+     * one PWM cycle never set FLTACT by the time the ISR runs â€” but
      * FLTEVT latches the event. Non-zero count = duty being chopped. */
     if (PCI_FAULT_EVT_PG1 || PCI_FAULT_EVT_PG2 || PCI_FAULT_EVT_PG3)
     {
@@ -1661,13 +1351,13 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
     }
 #endif
 
-    /* Software hard fault — immediate shutdown (Mode 2 only).
+    /* Software hard fault â€” immediate shutdown (Mode 2 only).
      * DEBOUNCED 3 consecutive samples (2026-06-10): a single garbage bus-ADC
-     * sample (the readout spikes to the rail at random transition moments —
+     * sample (the readout spikes to the rail at random transition moments â€”
      * bench: +22A reads with the bridge OFF) was latching phantom OC_SW and
-     * killing healthy runs. Real overcurrent is sustained for ≫3 ADC ticks
-     * (~67µs), and the truly fast events belong to the CMP3 HARDWARE
-     * comparator layer anyway — the software check is the slow backstop. */
+     * killing healthy runs. Real overcurrent is sustained for â‰«3 ADC ticks
+     * (~67Âµs), and the truly fast events belong to the CMP3 HARDWARE
+     * comparator layer anyway â€” the software check is the slow backstop. */
 #if OC_PROTECT_MODE == 2
     {
         static uint8_t s_ocFaultDebounce = 0;
@@ -1698,891 +1388,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
 #endif
 #endif /* FEATURE_HW_OVERCURRENT */
 
-#if FEATURE_FOC
-    /* ── FOC control path — replaces ENTIRE 6-step state machine ──
-     * Architecture from RK1 (proven on A2212 1400KV):
-     *   - Inline modular calls (no MCAPP_FOCStateMachine black box)
-     *   - V/f voltage-mode with gradual PLL angle correction
-     *   - POT=0 → motor coasts to stop; POT>0 → resumes (no re-arm)
-     *   - No ESC_RUNNING state — PLL correction makes CL implicit
-     */
-    {
-        /* Convert ADC counts → physical units using calibrated offsets */
-        float ia    = counts_to_amps_cal(raw_ia, s_ia_offset);
-        float ib    = counts_to_amps_cal(raw_ib, s_ib_offset);
-        s_vbus      = counts_to_vbus(garudaData.vbusRaw);
-
-        /* Dynamic PI voltage clamp — must match circular limiter (Vbus/sqrt(3))
-         * so anti-windup engages at the real output ceiling, not 1.73x above it. */
-        {
-            float vclamp = s_vbus * 0.95f * 0.577350269f;
-            s_pid_d.out_max =  vclamp;
-            s_pid_d.out_min = -vclamp;
-            s_pid_q.out_max =  vclamp;
-            s_pid_q.out_min = -vclamp;
-        }
-
-        /* Throttle source: use garudaData.throttle (already muxed above) */
-        uint16_t throttle_raw = garudaData.throttle;
-
-        /* State dispatch */
-        ESC_STATE_T state = garudaData.state;
-
-        if (state == ESC_IDLE || state == ESC_ARMED)
-        {
-            /* Outputs off — PWM overrides already asserted */
-            s_ovr_released = false;
-
-            /* ADC zero-current offset calibration (motor off → no current) */
-            if (!s_cal_done) {
-                s_ia_accum += raw_ia;
-                s_ib_accum += raw_ib;
-                if (++s_cal_count >= CAL_SAMPLES) {
-                    s_ia_offset = (uint16_t)(s_ia_accum >> CAL_SHIFT);
-                    s_ib_offset = (uint16_t)(s_ib_accum >> CAL_SHIFT);
-                    s_cal_done  = true;
-                }
-            }
-
-            goto foc_slow_loop;
-        }
-        else if (state == ESC_CLOSED_LOOP)
-        {
-            /* ── I/f (current-forced) sensorless FOC ─────────────────────
-             * PI current controllers active from tick 0.
-             * Phase 1 (alignment): θ=0 fixed, Iq ramps 0→ALIGN_IQ.
-             * Phase 2 (I/f OL):    θ forced at pot speed, Id=0 + Iq=RAMP_IQ.
-             * Phase 3 (CL):        PLL angle, speed PI → Iq reference.
-             *
-             * Key advantage over V/f: on low-Rs motors (A2212, 0.065Ω),
-             * any angle error θ_err causes Id_waste = V*sin(θ_err)/Rs.
-             * V/f cannot correct this (voltage is set, not current).
-             * I/f commands Id=0 and PI instantly cancels d-axis waste. */
-
-            /* Release PWM overrides once at CLOSED_LOOP entry */
-            if (!s_ovr_released) {
-                HAL_PWM_ReleaseAllOverrides();
-                s_ovr_released = true;
-            }
-
-#if FOC_DIAG_PWM_TEST == 1
-            /* ── DIAG 1: PWM-only — 50% duty, no FOC math ──────── */
-            HAL_PWM_SetDutyFloat3Phase(0.5f, 0.5f, 0.5f);
-            garudaData.focSubState = 99;
-            goto foc_slow_loop;
-#elif FOC_DIAG_PWM_TEST == 2
-            /* ── DIAG 2: Open-loop voltage — tests current sensing ─
-             * Applies fixed Vq=0.2V at θ=0 (no PI, no feedback).
-             * Expected: Iq ≈ Vq/Rs = 0.2/0.065 = 3.1A (POSITIVE).
-             * If Iq is NEGATIVE → current sense polarity is inverted.
-             * If Iq ≈ 0 → current sensing not working.
-             * focSubState=98 confirms this code path. */
-            {
-                float vq_test = 0.2f;  /* 0.2V → ~3A on A2212 */
-                float theta_test = 0.0f;
-
-                /* Read + convert currents for telemetry */
-                AlphaBeta_t iab_diag;
-                clarke_transform(ia, ib, &iab_diag);
-                DQ_t idq_diag;
-                park_transform(&iab_diag, theta_test, &idq_diag);
-
-                /* Fixed voltage — no PI */
-                DQ_t vdq_diag = { .d = 0.0f, .q = vq_test };
-                AlphaBeta_t vab_diag;
-                inv_park_transform(&vdq_diag, theta_test, &vab_diag);
-                float da2, db2, dc2;
-                svpwm_update(vab_diag.alpha, vab_diag.beta, s_vbus, &da2, &db2, &dc2);
-                HAL_PWM_SetDutyFloat3Phase(da2, db2, dc2);
-
-                /* Telemetry: pack id/iq into focIa/focIb for easy reading */
-                garudaData.focIa    = idq_diag.d;  /* expect ~0 */
-                garudaData.focIb    = idq_diag.q;  /* expect ~+3A if polarity OK */
-                garudaData.focTheta = theta_test;
-                garudaData.focVbus  = s_vbus;
-                garudaData.focSubState = 98;
-            }
-            goto foc_slow_loop;
-#elif FOC_DIAG_PWM_TEST == 3
-            /* ── DIAG 3: FOC with PI, no feedforward ────────────── */
-            /* Falls through to normal FOC but feedforward is zeroed below */
-#endif
-
-            /* ── Angle + Current Reference Management ──────────────── */
-            bool in_align = (s_align_ctr < STARTUP_ALIGN_TICKS);
-            float theta_drive;
-            float id_ref = 0.0f;
-            float iq_ref;
-
-            if (in_align) {
-                /* Phase 1: Alignment at θ=0 with gradual Iq ramp.
-                 * Ramp prevents L/R transient spike (L/R=0.46ms for A2212).
-                 * Iq at θ=0 creates field at 90° elec → rotor locks there. */
-                s_align_ctr++;
-                s_theta_ol = 0.0f;
-                s_omega_ol = 0.0f;
-                theta_drive = 0.0f;
-                float align_frac = (float)s_align_ctr / (float)STARTUP_ALIGN_TICKS;
-                iq_ref = STARTUP_ALIGN_IQ_A * align_frac;
-
-            } else if (!s_cl_active) {
-                /* Phase 2: I/f open-loop — forced angle + PI current control.
-                 * POT controls speed target, slew-rate limited. PI maintains
-                 * Id=0 and Iq=RAMP_IQ. No V/f formula — PI computes voltage. */
-                float pot_target;
-                if (throttle_raw < THROTTLE_DEADBAND) {
-                    pot_target = 0.0f;
-                } else {
-                    float pot_frac = (float)(throttle_raw - THROTTLE_DEADBAND)
-                                   / (4095.0f - (float)THROTTLE_DEADBAND);
-                    pot_target = pot_frac * STARTUP_MAX_OL_RAD_S;
-                }
-
-                /* Slew-rate limited speed ramp */
-                float max_delta = STARTUP_RAMP_RATE_RPS2 * FOC_TS_FAST_S;
-                if (s_omega_ol < pot_target) {
-                    s_omega_ol += max_delta;
-                    if (s_omega_ol > pot_target) s_omega_ol = pot_target;
-                } else if (s_omega_ol > pot_target) {
-                    s_omega_ol -= max_delta;
-                    if (s_omega_ol < pot_target) s_omega_ol = pot_target;
-                }
-
-                /* Advance forced angle */
-                s_theta_ol += s_omega_ol * FOC_TS_FAST_S;
-                if (s_theta_ol >= 6.28318530718f) s_theta_ol -= 6.28318530718f;
-                theta_drive = s_theta_ol;
-
-                /* I/f current: ramp from ALIGN_IQ to RAMP_IQ over IQ_RAMP_TICKS */
-                if (s_iq_ramp_ctr < STARTUP_IQ_RAMP_TICKS) {
-                    s_iq_ramp_ctr++;
-                    float frac = (float)s_iq_ramp_ctr / (float)STARTUP_IQ_RAMP_TICKS;
-                    iq_ref = STARTUP_ALIGN_IQ_A
-                           + (STARTUP_RAMP_IQ_A - STARTUP_ALIGN_IQ_A) * frac;
-                } else {
-                    iq_ref = STARTUP_RAMP_IQ_A;
-                }
-
-#if FEATURE_CLOSED_LOOP
-                /* PLL angle correction + CL transition check.
-                 * Observer lag compensation: BEMF EMA introduces phase lag
-                 * that makes PLL trail the true rotor. Compensate forward. */
-                if (s_omega_ol >= STARTUP_HANDOFF_RAD_S) {
-                    float pll_rotor = pll_rotor_angle();
-
-                    /* Compensate observer EMA phase lag */
-                    float lag_comp = OBS_LAG_COEFF * s_omega_ol * FOC_TS_FAST_S;
-                    if (lag_comp > OBS_LAG_COMP_MAX_RAD) lag_comp = OBS_LAG_COMP_MAX_RAD;
-                    pll_rotor += lag_comp;
-                    if (pll_rotor >= 6.28318530718f) pll_rotor -= 6.28318530718f;
-
-                    float err = pll_rotor - s_theta_ol;
-                    if (err >  3.14159265f) err -= 6.28318530718f;
-                    if (err < -3.14159265f) err += 6.28318530718f;
-
-                    /* Nudge forced angle toward PLL */
-                    s_theta_ol += PLL_CORRECTION_GAIN * err;
-                    if (s_theta_ol < 0.0f)            s_theta_ol += 6.28318530718f;
-                    if (s_theta_ol >= 6.28318530718f) s_theta_ol -= 6.28318530718f;
-
-                    /* CL transition: PLL tracks OL within tolerance */
-                    if (fabsf(err) < CL_ANGLE_TOL_RAD) {
-                        if (++s_cl_lock_ctr >= CL_LOCK_COUNT) {
-                            s_cl_active = true;
-                            /* Bumpless transfer: seed speed PI integrator
-                             * so its output matches current Iq reference.
-                             * PI output = Kp*err + integrator, err≈0 at lock
-                             * → integrator ≈ output ≈ iq_ref. */
-                            s_pid_spd.integrator = iq_ref;
-                        }
-                    } else {
-                        s_cl_lock_ctr = 0;
-                    }
-                }
-#endif
-            } else {
-                /* Phase 3: Full closed-loop — angle + speed PI.
-                 * MXLEMMING provides angle (no PLL pi/2 offset, no EMA lag).
-                 * PLL provides speed (inherently filtered by PI loop filter;
-                 * MXLEMMING dtheta/dt is too noisy for speed PI feedback). */
-#if FEATURE_MXLEMMING
-                theta_drive = s_mxl.theta_est;
-#else
-                theta_drive = pll_rotor_angle();
-#endif
-                float cl_omega = s_pll.omega_est;
-
-                /* Speed reference from pot */
-                float speed_ref;
-                if (throttle_raw < THROTTLE_DEADBAND) {
-                    speed_ref = 0.0f;
-                } else {
-                    float pot_frac = (float)(throttle_raw - THROTTLE_DEADBAND)
-                                   / (4095.0f - (float)THROTTLE_DEADBAND);
-                    speed_ref = pot_frac * MOTOR_MAX_ELEC_RAD_S;
-                }
-
-                /* Speed PI → Iq reference */
-                iq_ref = pi_update(&s_pid_spd, speed_ref - cl_omega,
-                                   FOC_TS_FAST_S);
-
-                /* Track speed for telemetry */
-                s_omega_ol = cl_omega;
-            }
-
-            /* ── FOC Pipeline: Clarke → Park → PI → InvPark → SVPWM ── */
-            AlphaBeta_t iab;
-            clarke_transform(ia, ib, &iab);
-
-            DQ_t idq;
-            park_transform(&iab, theta_drive, &idq);
-
-            DQ_t vdq;
-            vdq.d = pi_update(&s_pid_d, id_ref - idq.d, FOC_TS_FAST_S);
-            vdq.q = pi_update(&s_pid_q, iq_ref - idq.q, FOC_TS_FAST_S);
-
-            /* ── BEMF + cross-coupling feedforward ──────────────────── */
-            {
-#if FOC_DIAG_PWM_TEST == 3
-                float omega_ff = 0.0f;  /* DIAG 3: feedforward disabled */
-#else
-                /* Always use PLL omega for feedforward — it's inherently
-                 * filtered (PI loop filter), so no voltage spikes from
-                 * MXLEMMING dtheta/dt noise at low flux. */
-                float omega_ff = s_cl_active ? s_pll.omega_est : s_omega_ol;
-#endif
-
-                /* BEMF feedforward on q-axis */
-                float bemf_ff = omega_ff * MOTOR_KE_VPEAK;
-                /* Cross-coupling decoupling */
-                float vd_decouple = -idq.q * omega_ff * MOTOR_LS_H;
-                float vq_decouple = +idq.d * omega_ff * MOTOR_LS_H;
-
-                vdq.d += vd_decouple;
-                vdq.q += bemf_ff + vq_decouple;
-
-                /* Circular voltage limiting (d-axis priority, Vbus/sqrt(3)) */
-                float vmax = s_vbus * 0.95f * 0.577350269f;
-                if (vdq.d >  vmax) vdq.d =  vmax;
-                if (vdq.d < -vmax) vdq.d = -vmax;
-                float sq = vmax * vmax - vdq.d * vdq.d;
-                if (sq < 0.0f) sq = 0.0f;  /* FP rounding safety */
-                float vq_lim = sqrtf(sq);
-                if (vdq.q >  vq_lim) vdq.q =  vq_lim;
-                if (vdq.q < -vq_lim) vdq.q = -vq_lim;
-            }
-
-            AlphaBeta_t vab;
-            inv_park_transform(&vdq, theta_drive, &vab);
-
-            float da, db, dc;
-            svpwm_update(vab.alpha, vab.beta, s_vbus, &da, &db, &dc);
-            HAL_PWM_SetDutyFloat3Phase(da, db, dc);
-
-            /* Telemetry */
-            garudaData.focIa = ia;
-            garudaData.focIb = ib;
-            {
-                float ic_phase = -(ia + ib);
-                garudaData.focIdcEst = da * ia + db * ib + dc * ic_phase;
-            }
-
-            /* Observer chain — uses shared iab and vab.
-             * PLL always runs (needed for OL→CL lock detection).
-             * MXLEMMING runs in parallel; drives CL angle when active. */
-            {
-                bemf_obs_update(&s_obs,
-                                vab.alpha, vab.beta,
-                                iab.alpha, iab.beta,
-                                FOC_TS_FAST_S);
-                pll_update(&s_pll, s_obs.e_alpha, s_obs.e_beta, FOC_TS_FAST_S);
-                flux_est_update(&s_flux_est, s_obs.e_alpha, s_obs.e_beta, FOC_TS_FAST_S);
-#if FEATURE_SMO
-                smo_update(&s_smo,
-                           vab.alpha, vab.beta,
-                           iab.alpha, iab.beta);
-                pll_update(&s_pll_smo, s_smo.e_alpha, s_smo.e_beta, FOC_TS_FAST_S);
-#endif
-#if FEATURE_MXLEMMING
-                mxl_update(&s_mxl,
-                           vab.alpha, vab.beta,
-                           iab.alpha, iab.beta,
-                           FOC_TS_FAST_S);
-#endif
-            }
-
-            /* Update telemetry for GSP/GUI.
-             * focSubState: 0=align, 1=OL ramp, 2=OL+PLL tracking, 3=CL */
-            garudaData.focTheta    = theta_drive;
-            garudaData.focOmega    = s_pll.omega_est;
-            garudaData.focVbus     = s_vbus;
-#if FEATURE_MXLEMMING
-            garudaData.focTheta2   = s_mxl.theta_est;
-#else
-            garudaData.focTheta2   = pll_rotor_angle();
-#endif
-            garudaData.focSubState = in_align ? 0
-                                   : s_cl_active ? 3
-                                   : (s_omega_ol >= STARTUP_HANDOFF_RAD_S ? 2 : 1);
-            garudaData.focOffsetIa = s_ia_offset;
-            garudaData.focOffsetIb = s_ib_offset;
-#if FEATURE_SMO
-            garudaData.focSmoTheta = smo_rotor_angle();
-            garudaData.focSmoOmega = s_pll_smo.omega_est;
-#endif
-
-            /* Phase current overcurrent protection (ibusRaw=0 at PWM valley).
-             * Use |Ia|+|Ib| > FAULT_OC_A as fast proxy for peak phase current.
-             * Debounce 2ms to reject switching transients. */
-            {
-                float i_mag = fabsf(ia) + fabsf(ib);
-                if (i_mag > FAULT_OC_A) {
-                    if (++s_foc_oc_ctr >= FOC_OC_DEBOUNCE) {
-                        HAL_MC1PWMDisableOutputs();
-                        garudaData.state     = ESC_FAULT;
-                        garudaData.faultCode = FAULT_OVERCURRENT;
-                        garudaData.runCommandActive = false;
-                        LED2 = 0;
-                        s_foc_oc_ctr = 0;
-                    }
-                } else {
-                    s_foc_oc_ctr = 0;
-                }
-            }
-
-            /* Stall detection — only when throttle demands motion.
-             * In I/f: stall = PLL speed near zero while forced angle advancing. */
-            if (throttle_raw >= THROTTLE_DEADBAND &&
-                !in_align &&
-                fabsf(s_pll.omega_est) < FAULT_STALL_RAD_S &&
-                s_omega_ol > STARTUP_HANDOFF_RAD_S) {
-                if (++s_stall_ctr >= (uint32_t)(FAULT_STALL_TIMEOUT_MS * FOC_SLOW_DIV)) {
-                    HAL_MC1PWMDisableOutputs();
-                    garudaData.state     = ESC_FAULT;
-                    garudaData.faultCode = FAULT_STALL;
-                    garudaData.runCommandActive = false;
-                    LED2 = 0;
-                    s_stall_ctr = 0;
-                }
-            } else {
-                s_stall_ctr = 0;
-            }
-        }
-        else if (state == ESC_FAULT)
-        {
-            HAL_MC1PWMDisableOutputs();
-        }
-        /* ESC_IDLE, ESC_ARMED: handled above (offset cal + goto slow loop) */
-
-    foc_slow_loop:
-        /* ── Slow loop (every FOC_SLOW_DIV ticks → 1 kHz) ────────────── */
-        if (++s_slow_ctr >= FOC_SLOW_DIV)
-        {
-            s_slow_ctr = 0;
-            state = garudaData.state;  /* Re-read after fast loop may have changed it */
-
-            /* Arming counter — moved from Timer1 ISR to avoid cross-ISR races */
-            if (state == ESC_ARMED)
-            {
-                if (throttle_raw < THROTTLE_DEADBAND) {
-                    if (++garudaData.armCounter >= (uint32_t)FOC_ARM_TIME_MS) {
-                        /* Throttle held at zero for ARM_TIME_MS → enter FOC */
-                        foc_startup_reset();
-                        bemf_obs_reset(&s_obs);
-                        pll_reset(&s_pll);
-#if FEATURE_SMO
-                        smo_reset(&s_smo);
-                        pll_reset(&s_pll_smo);
-#endif
-                        /* Pre-load center duty before releasing overrides */
-                        HAL_PWM_SetDutyFloat3Phase(0.5f, 0.5f, 0.5f);
-                        garudaData.state = ESC_CLOSED_LOOP;
-                        LED2 = 1;
-                    }
-                } else {
-                    garudaData.armCounter = 0;
-                }
-            }
-        }
-    } /* end FOC scope */
-#elif FEATURE_FOC_V2
-    /* ── FOC v2 control path — closed-loop current control ──────────
-     * Architecture: MXLEMMING flux observer + Tustin PI + SVPWM.
-     * True Id/Iq current control from tick 0. No V/f waste.
-     * State machine: IDLE → ARMED → ALIGN → IF_RAMP → CLOSED_LOOP
-     */
-    {
-        /* Sync mode from main loop state changes */
-        if (garudaData.state == ESC_DETECT && s_foc_v2.mode == FOC_IDLE) {
-            /* Auto-detect triggered from main loop (GSP command) */
-            foc_detect_start(&s_foc_v2);
-        } else if (garudaData.state == ESC_ARMED && s_foc_v2.mode == FOC_IDLE) {
-            s_foc_v2.mode = FOC_ARMED;
-            s_foc_v2.arm_ctr = 0;
-        } else if (garudaData.state == ESC_IDLE &&
-                   s_foc_v2.mode != FOC_IDLE &&
-                   s_foc_v2.mode != FOC_MOTOR_DETECT) {
-            s_foc_v2.mode = FOC_IDLE;
-            /* Reset calibration for next run */
-            s_foc_v2.cal_done = false;
-            s_foc_v2.cal_count = 0;
-            s_foc_v2.cal_accum_a = 0;
-            s_foc_v2.cal_accum_b = 0;
-        }
-
-        /* Re-init FOC with updated motor params (after profile load) */
-        if (gspFocReinitNeeded && s_foc_v2.mode == FOC_IDLE) {
-            FOC_MotorParams_t mp = BuildFocMotorParams();
-            foc_v2_init(&s_foc_v2, &mp);
-            gspFocReinitNeeded = false;
-        }
-
-        /* FOC v2 uses raw_ia/raw_ib already read at ISR entry */
-        uint16_t throttle_v2 = garudaData.throttle;
-
-        float da_v2, db_v2, dc_v2;
-        foc_v2_fast_tick(&s_foc_v2,
-                         raw_ia, raw_ib,
-                         garudaData.vbusRaw, throttle_v2,
-                         &da_v2, &db_v2, &dc_v2);
-
-        /* Release PWM overrides when entering active modes */
-        {
-            static bool v2_ovr_released = false;
-            if ((s_foc_v2.mode >= FOC_MOTOR_DETECT && s_foc_v2.mode <= FOC_CLOSED_LOOP)) {
-                if (!v2_ovr_released) {
-                    HAL_PWM_ReleaseAllOverrides();
-                    v2_ovr_released = true;
-                }
-                HAL_PWM_SetDutyFloat3Phase(da_v2, db_v2, dc_v2);
-            } else if (s_foc_v2.mode == FOC_FAULT && v2_ovr_released) {
-                /* Fault: force 50% duty (zero net voltage) to stop motor */
-                HAL_PWM_SetDutyFloat3Phase(0.5f, 0.5f, 0.5f);
-            } else {
-                v2_ovr_released = false;
-            }
-        }
-
-        /* After detect completes: write ALL detected + derived params back
-         * to gspParams BEFORE state mapping (ESC_DETECT → ESC_ARMED).
-         * This ensures SAVE_CONFIG persists a complete, self-consistent set
-         * that produces the same FOC behavior after MCU reset. */
-        if (s_foc_v2.mode == FOC_ARMED && garudaData.state == ESC_DETECT) {
-            /* Motor params */
-            gspParams.focRsMilliOhm    = (uint16_t)(s_foc_v2.Rs * 1000.0f + 0.5f);
-            gspParams.focLsMicroH      = (uint16_t)(s_foc_v2.Ls * 1e6f + 0.5f);
-            gspParams.focKeUvSRad      = (uint16_t)(s_foc_v2.Ke * 1e6f + 0.5f);
-            /* PI gains (pole cancellation from detected Rs, Ls) */
-            gspParams.focKpDqMilli     = (uint16_t)(s_foc_v2.pid_d.kp * 1000.0f + 0.5f);
-            gspParams.focKiDq          = (uint16_t)(s_foc_v2.pid_d.ki + 0.5f);
-            /* Max speed from Vbus/Ke */
-            gspParams.focMaxElecRadS   = (uint16_t)(s_foc_v2.max_elec_rad_s + 0.5f);
-            /* Startup params */
-            gspParams.focHandoffRadS   = (uint16_t)(s_foc_v2.handoff_rad_s + 0.5f);
-            gspParams.focRampRateRps2  = (uint16_t)(s_foc_v2.ramp_rate + 0.5f);
-            gspParams.focAlignIqCentiA = (uint16_t)(s_foc_v2.align_iq * 100.0f + 0.5f);
-            gspParams.focRampIqCentiA  = (uint16_t)(s_foc_v2.ramp_iq * 100.0f + 0.5f);
-            gspParams.focFaultOcCentiA = (uint16_t)(s_foc_v2.fault_oc_a * 100.0f + 0.5f);
-        }
-
-        /* Map FOC v2 mode to ESC state for main loop compatibility.
-         * Don't overwrite ESC_DETECT when FOC is still IDLE — main loop
-         * sets ESC_DETECT, ISR must not clobber it before processing. */
-        switch (s_foc_v2.mode) {
-            case FOC_IDLE:
-                if (garudaData.state != ESC_DETECT)
-                    garudaData.state = ESC_IDLE;
-                break;
-            case FOC_ARMED:        garudaData.state = ESC_ARMED; break;
-            case FOC_MOTOR_DETECT: garudaData.state = ESC_DETECT; break;
-            case FOC_ALIGN:        garudaData.state = ESC_ALIGN; break;
-            case FOC_IF_RAMP:      garudaData.state = ESC_OL_RAMP; break;
-            case FOC_CLOSED_LOOP:  garudaData.state = ESC_CLOSED_LOOP; break;
-            case FOC_FAULT:        garudaData.state = ESC_FAULT; break;
-            default:               garudaData.state = ESC_FAULT; break;
-        }
-
-        /* Fault propagation */
-        if (s_foc_v2.mode == FOC_FAULT) {
-            HAL_MC1PWMDisableOutputs();
-            if (garudaData.faultCode == FAULT_NONE)
-                garudaData.faultCode = s_foc_v2.fault_code ? s_foc_v2.fault_code : FAULT_FOC_INTERNAL;
-            garudaData.runCommandActive = false;
-            LED2 = 0;
-        }
-
-        /* Telemetry update */
-#if FEATURE_FOC_V2
-        garudaData.focIdMeas   = s_foc_v2.id_meas;
-        garudaData.focIqMeas   = s_foc_v2.iq_meas;
-        garudaData.focTheta    = (s_foc_v2.mode == FOC_MOTOR_DETECT)
-                                   ? s_foc_v2.theta_if : s_foc_v2.theta;
-        garudaData.focOmega    = (s_foc_v2.mode == FOC_MOTOR_DETECT)
-                                   ? s_foc_v2.omega_if : s_foc_v2.omega_pll;
-        garudaData.focVbus     = s_foc_v2.vbus;
-        garudaData.focIa       = v2_counts_to_amps(raw_ia, (uint16_t)s_foc_v2.ia_offset);
-        garudaData.focIb       = v2_counts_to_amps(raw_ib, (uint16_t)s_foc_v2.ib_offset);
-        garudaData.focThetaObs = s_foc_v2.theta_obs;
-        garudaData.focVd       = s_foc_v2.vd;
-        garudaData.focVq       = s_foc_v2.vq;
-        /* Observer internals */
-        garudaData.focFluxAlpha   = s_foc_v2.obs.x1;
-        garudaData.focFluxBeta    = s_foc_v2.obs.x2;
-        garudaData.focLambdaEst   = s_foc_v2.obs.lambda_est;
-        garudaData.focObsGain     = s_foc_v2.obs.gain;
-        /* PI controller internals */
-        garudaData.focPidDInteg   = s_foc_v2.pid_d.integral;
-        garudaData.focPidQInteg   = s_foc_v2.pid_q.integral;
-        garudaData.focPidSpdInteg = s_foc_v2.pid_spd.integral;
-        /* Derived diagnostics */
-        {
-            float vd = s_foc_v2.vd, vq = s_foc_v2.vq;
-            float vbus = s_foc_v2.vbus;
-            float v_mag = sqrtf(vd * vd + vq * vq);
-            float v_max = vbus * 0.57735027f;  /* 1/sqrt(3) */
-            garudaData.focModIndex = (v_max > 0.1f) ? (v_mag / v_max) : 0.0f;
-
-            float fx = s_foc_v2.obs.x1, fy = s_foc_v2.obs.x2;
-            float flux_mag = sqrtf(fx * fx + fy * fy);
-            float lam = s_foc_v2.lambda_pm;
-            garudaData.focObsConfidence = (lam > 0.0f)
-                ? (1.0f - fabsf(flux_mag - lam) / lam) : 0.0f;
-            if (garudaData.focObsConfidence < 0.0f)
-                garudaData.focObsConfidence = 0.0f;
-        }
-        garudaData.focSubState = (s_foc_v2.mode == FOC_MOTOR_DETECT)
-                                   ? (uint8_t)s_foc_v2.detect_state
-                                   : s_foc_v2.sub_state;
-        garudaData.focOffsetIa = (uint16_t)s_foc_v2.ia_offset;
-        garudaData.focOffsetIb = (uint16_t)s_foc_v2.ib_offset;
-
-        /* Populate duty for telemetry: max of 3 SVPWM phase duties */
-        {
-            float dmax = da_v2;
-            if (db_v2 > dmax) dmax = db_v2;
-            if (dc_v2 > dmax) dmax = dc_v2;
-            garudaData.duty = (uint32_t)(dmax * LOOPTIME_TCY);
-        }
-
-#if FEATURE_BURST_SCOPE
-        /* Write burst scope sample from ISR-local FOC state */
-        {
-            SCOPE_SAMPLE_T ss;
-            ss.ia    = (int16_t)(garudaData.focIa * 1000.0f);
-            ss.ib    = (int16_t)(garudaData.focIb * 1000.0f);
-            ss.id    = (int16_t)(s_foc_v2.id_meas * 1000.0f);
-            ss.iq    = (int16_t)(s_foc_v2.iq_meas * 1000.0f);
-            ss.vd    = (int16_t)(s_foc_v2.vd * 100.0f);
-            ss.vq    = (int16_t)(s_foc_v2.vq * 100.0f);
-            ss.theta = (int16_t)(s_foc_v2.theta * 10000.0f);
-            ss.obs_x1 = (int16_t)(s_foc_v2.obs.x1 * 100000.0f);
-            ss.obs_x2 = (int16_t)(s_foc_v2.obs.x2 * 100000.0f);
-            /* Omega ×1 scaling (1 rad/s resolution, range ±32767).
-             * ×10 overflows int16 at 3276 rad/s — A2212 reaches 6000+. */
-            {
-                float omega_clamped = s_foc_v2.omega_pll;
-                if (omega_clamped > 32767.0f) omega_clamped = 32767.0f;
-                if (omega_clamped < -32768.0f) omega_clamped = -32768.0f;
-                ss.omega = (int16_t)(omega_clamped);
-            }
-            ss.mod_index = (int16_t)(garudaData.focModIndex * 10000.0f);
-            ss.flags  = (s_foc_v2.cl_active ? 0x01 : 0x00)
-                      | ((garudaData.state == ESC_FAULT) ? 0x02 : 0x00)
-                      | (((uint8_t)s_foc_v2.mode & 0x07) << 2);
-            ss.state  = (uint8_t)garudaData.state;
-            ss.tick_lsb = (uint16_t)(garudaData.systemTick & 0xFFFF);
-            Scope_WriteSample(&ss);
-        }
-#endif
-#endif
-    } /* end FOC v2 scope */
-#elif FEATURE_FOC_V3
-    /* ── FOC v3 control path — SMO observer + OL ramp startup ──────
-     * Architecture: Sliding Mode Observer + Tustin PI + SVPWM.
-     * State machine: IDLE → ARMED → ALIGN → OL_RAMP → CLOSED_LOOP
-     */
-    {
-        /* Sync mode from main loop state changes */
-        if (garudaData.state == ESC_ARMED && s_foc_v3.mode == V3_IDLE) {
-            s_foc_v3.mode = V3_ARMED;
-            s_foc_v3.arm_ctr = 0;
-        } else if (garudaData.state == ESC_IDLE &&
-                   s_foc_v3.mode != V3_IDLE) {
-            s_foc_v3.mode = V3_IDLE;
-            s_foc_v3.cal_done = false;
-            s_foc_v3.cal_count = 0;
-            s_foc_v3.cal_accum_a = 0;
-            s_foc_v3.cal_accum_b = 0;
-        }
-
-        /* Re-init FOC with updated motor params (after profile load) */
-        if (gspFocReinitNeeded && s_foc_v3.mode == V3_IDLE) {
-            FOC_MotorParams_t mp = BuildFocMotorParams();
-            foc_v3_init(&s_foc_v3, &mp);
-            gspFocReinitNeeded = false;
-        }
-
-        uint16_t throttle_v3 = garudaData.throttle;
-
-        float da_v3, db_v3, dc_v3;
-        foc_v3_fast_tick(&s_foc_v3,
-                         raw_ia, raw_ib,
-                         garudaData.vbusRaw, throttle_v3,
-                         &da_v3, &db_v3, &dc_v3);
-
-        /* Release PWM overrides when entering active modes */
-        {
-            static bool v3_ovr_released = false;
-            if (s_foc_v3.mode >= V3_ALIGN && s_foc_v3.mode <= V3_VF_ASSIST) {
-                if (!v3_ovr_released) {
-                    HAL_PWM_ReleaseAllOverrides();
-                    v3_ovr_released = true;
-                }
-                HAL_PWM_SetDutyFloat3Phase(da_v3, db_v3, dc_v3);
-            } else if (s_foc_v3.mode == V3_FAULT && v3_ovr_released) {
-                HAL_PWM_SetDutyFloat3Phase(0.5f, 0.5f, 0.5f);
-            } else {
-                v3_ovr_released = false;
-            }
-        }
-
-        /* Map FOC v3 mode to ESC state for main loop compatibility */
-        switch (s_foc_v3.mode) {
-            case V3_IDLE:         garudaData.state = ESC_IDLE; break;
-            case V3_ARMED:        garudaData.state = ESC_ARMED; break;
-            case V3_ALIGN:        garudaData.state = ESC_ALIGN; break;
-            case V3_OL_RAMP:      garudaData.state = ESC_OL_RAMP; break;
-            case V3_CLOSED_LOOP:  garudaData.state = ESC_CLOSED_LOOP; break;
-            case V3_VF_ASSIST:    garudaData.state = ESC_OL_RAMP; break;  /* Map to OL for compat */
-            case V3_FAULT:        garudaData.state = ESC_FAULT; break;
-            default:              garudaData.state = ESC_FAULT; break;
-        }
-
-        /* Fault propagation */
-        if (s_foc_v3.mode == V3_FAULT) {
-            HAL_MC1PWMDisableOutputs();
-            if (garudaData.faultCode == FAULT_NONE)
-                garudaData.faultCode = s_foc_v3.fault_code ? s_foc_v3.fault_code : FAULT_FOC_INTERNAL;
-            garudaData.runCommandActive = false;
-            LED2 = 0;
-        }
-
-        /* Telemetry update */
-        garudaData.focIdMeas   = s_foc_v3.id_meas;
-        garudaData.focIqMeas   = s_foc_v3.iq_meas;
-        garudaData.focTheta    = s_foc_v3.theta;
-        garudaData.focOmega    = s_foc_v3.omega_pll;
-        garudaData.focVbus     = s_foc_v3.vbus;
-        garudaData.focIa       = v2_counts_to_amps(raw_ia, (uint16_t)s_foc_v3.ia_offset);
-        garudaData.focIb       = v2_counts_to_amps(raw_ib, (uint16_t)s_foc_v3.ib_offset);
-        garudaData.focThetaObs = s_foc_v3.theta_obs;
-        garudaData.focVd       = s_foc_v3.vd;
-        garudaData.focVq       = s_foc_v3.vq;
-        /* SMO internals → flux telemetry fields (repurposed) */
-        garudaData.focFluxAlpha   = s_foc_v3.smo.e2_alpha;
-        garudaData.focFluxBeta    = s_foc_v3.smo.e2_beta;
-        garudaData.focLambdaEst   = s_foc_v3.omega;  /* LP-filtered speed (speed PI feedback) */
-        garudaData.focObsGain     = s_foc_v3.smo.k_base;
-        garudaData.focPidDInteg   = s_foc_v3.pid_d.integral;
-        garudaData.focPidQInteg   = s_foc_v3.pid_q.integral;
-        garudaData.focPidSpdInteg = s_foc_v3.pid_spd.integral;
-        /* Derived diagnostics */
-        {
-            float vd = s_foc_v3.vd, vq = s_foc_v3.vq;
-            float vbus = s_foc_v3.vbus;
-            float v_mag = sqrtf(vd * vd + vq * vq);
-            float v_max = vbus * 0.57735027f;
-            garudaData.focModIndex = (v_max > 0.1f) ? (v_mag / v_max) : 0.0f;
-            garudaData.focObsConfidence = s_foc_v3.smo.confidence;
-        }
-        garudaData.focSubState = s_foc_v3.sub_state;
-        garudaData.focOffsetIa = (uint16_t)s_foc_v3.ia_offset;
-        garudaData.focOffsetIb = (uint16_t)s_foc_v3.ib_offset;
-
-        /* V4 observer diagnostics */
-        garudaData.smoResidual    = s_foc_v3.smo.residual;
-        garudaData.pllInnovation  = s_foc_v3.pll.innovation_lpf;
-        garudaData.pllOmega       = s_foc_v3.pll.omega_est;
-        garudaData.omegaOl        = (s_foc_v3.mode == V3_CLOSED_LOOP)
-                                  ? s_foc_v3.omega : s_foc_v3.omega_ol;
-        garudaData.handoffCtr     = (uint16_t)s_foc_v3.handoff_ctr;
-        garudaData.smoObservable  = s_foc_v3.smo.observable ? 1 : 0;
-
-        /* Duty for telemetry */
-        {
-            float dmax = da_v3;
-            if (db_v3 > dmax) dmax = db_v3;
-            if (dc_v3 > dmax) dmax = dc_v3;
-            garudaData.duty = (uint32_t)(dmax * LOOPTIME_TCY);
-        }
-
-#if FEATURE_BURST_SCOPE
-        /* Burst scope sample from v3 state */
-        {
-            SCOPE_SAMPLE_T ss;
-            ss.ia    = (int16_t)(garudaData.focIa * 1000.0f);
-            ss.ib    = (int16_t)(garudaData.focIb * 1000.0f);
-            ss.id    = (int16_t)(s_foc_v3.id_meas * 1000.0f);
-            ss.iq    = (int16_t)(s_foc_v3.iq_meas * 1000.0f);
-            ss.vd    = (int16_t)(s_foc_v3.vd * 100.0f);
-            ss.vq    = (int16_t)(s_foc_v3.vq * 100.0f);
-            ss.theta = (int16_t)(s_foc_v3.theta * 10000.0f);
-            ss.obs_x1 = (int16_t)(s_foc_v3.smo.e2_alpha * 100000.0f);
-            ss.obs_x2 = (int16_t)(s_foc_v3.smo.e2_beta * 100000.0f);
-            {
-                float omega_clamped = s_foc_v3.omega_pll;
-                if (omega_clamped > 32767.0f) omega_clamped = 32767.0f;
-                if (omega_clamped < -32768.0f) omega_clamped = -32768.0f;
-                ss.omega = (int16_t)(omega_clamped);
-            }
-            ss.mod_index = (int16_t)(garudaData.focModIndex * 10000.0f);
-            ss.flags  = (s_foc_v3.cl_active ? 0x01 : 0x00)
-                      | ((garudaData.state == ESC_FAULT) ? 0x02 : 0x00)
-                      | (((uint8_t)s_foc_v3.mode & 0x07) << 2);
-            ss.state  = (uint8_t)garudaData.state;
-            ss.tick_lsb = (uint16_t)(garudaData.systemTick & 0xFFFF);
-            Scope_WriteSample(&ss);
-        }
-#endif
-    } /* end FOC v3 scope */
-#elif FEATURE_FOC_AN1078
-    /* ── AN1078 control path — float port of Microchip reference ──
-     * State machine: STOPPED → LOCK → OPEN_LOOP → CLOSED_LOOP
-     * Direct port of pmsm.c + smcpos.c.  No PLL, no v2/v3 hybridization.
-     */
-    {
-        uint16_t throttle_an = garudaData.throttle;
-
-        /* Arming logic — mirror v3:
-         *   SW1 / GSP-run cmd → main loop sets garudaData.state = ESC_ARMED
-         *   We see ESC_ARMED + cal_done + no fault → AN_MotorStart
-         *   SW1 / GSP-stop or fault → main loop sets state = ESC_IDLE / ESC_FAULT
-         *   We see those → AN_MotorStop
-         * Throttle alone NEVER arms.  This matches v3 semantics. */
-
-        /* Hardware fault recovery: if board PCI tripped, force-stop AN1078
-         * so PI doesn't wind up against blocked PWM. */
-        if (garudaData.faultCode == FAULT_BOARD_PCI &&
-            s_foc_an.mode != AN_MODE_STOPPED) {
-            AN_MotorStop(&s_foc_an);
-        }
-
-        /* Main-loop wants us idle → stop. */
-        if ((garudaData.state == ESC_IDLE || garudaData.state == ESC_FAULT) &&
-            s_foc_an.mode != AN_MODE_STOPPED) {
-            AN_MotorStop(&s_foc_an);
-        }
-
-        /* Main-loop pressed SW1 / sent GSP run → state=ESC_ARMED →
-         * start when calibration done and no latched board fault. */
-        if (garudaData.state == ESC_ARMED &&
-            s_foc_an.mode == AN_MODE_STOPPED &&
-            s_foc_an.cal_done &&
-            garudaData.faultCode != FAULT_BOARD_PCI) {
-            AN_MotorStart(&s_foc_an);
-        }
-
-        float da_an, db_an, dc_an;
-        AN_MotorFastTick(&s_foc_an,
-                         raw_ia, raw_ib,
-                         garudaData.vbusRaw, throttle_an,
-                         &da_an, &db_an, &dc_an);
-
-        /* PWM enable: match V2/V3 pattern (proven on this hardware).
-         * Release overrides first, then write duty.  V2/V3's first PWM
-         * cycle sees duty register state from prior HAL_MC1PWMDisableOutputs
-         * (PWM_PDC*=0, gates LOW), then SetDuty kicks in next cycle. */
-        {
-            static bool an_ovr_released = false;
-            if (s_foc_an.mode >= AN_MODE_LOCK && s_foc_an.mode <= AN_MODE_CLOSED_LOOP) {
-                if (!an_ovr_released) {
-                    HAL_PWM_ReleaseAllOverrides();
-                    an_ovr_released = true;
-                }
-                HAL_PWM_SetDutyFloat3Phase(da_an, db_an, dc_an);
-            } else if (s_foc_an.mode == AN_MODE_FAULT && an_ovr_released) {
-                HAL_PWM_SetDutyFloat3Phase(0.5f, 0.5f, 0.5f);
-            } else if (s_foc_an.mode == AN_MODE_STOPPED && an_ovr_released) {
-                HAL_MC1PWMDisableOutputs();
-                an_ovr_released = false;
-            } else {
-                an_ovr_released = false;
-            }
-        }
-
-        /* Map AN1078 mode → ESC state.  DO NOT overwrite ESC_FAULT set
-         * externally by the hardware PCI ISR — main loop needs to see
-         * that fault state so SW1 fault-clear works. */
-        if (garudaData.state != ESC_FAULT) {
-            switch (s_foc_an.mode) {
-                case AN_MODE_STOPPED:     garudaData.state = ESC_IDLE; break;
-                case AN_MODE_LOCK:        garudaData.state = ESC_ALIGN; break;
-                case AN_MODE_OPEN_LOOP:   garudaData.state = ESC_OL_RAMP; break;
-                case AN_MODE_CLOSED_LOOP: garudaData.state = ESC_CLOSED_LOOP; break;
-                case AN_MODE_FAULT:       garudaData.state = ESC_FAULT; break;
-                default:                  garudaData.state = ESC_FAULT; break;
-            }
-        }
-
-        /* Fault propagation */
-        if (s_foc_an.mode == AN_MODE_FAULT) {
-            HAL_MC1PWMDisableOutputs();
-            if (garudaData.faultCode == FAULT_NONE)
-                garudaData.faultCode = s_foc_an.faultCode
-                                     ? s_foc_an.faultCode : FAULT_FOC_INTERNAL;
-            garudaData.runCommandActive = false;
-            LED2 = 0;
-        }
-
-        /* Telemetry — reuse v2/v3 fields */
-        garudaData.focIdMeas   = s_foc_an.id_meas;
-        garudaData.focIqMeas   = s_foc_an.iq_meas;
-        garudaData.focTheta    = s_foc_an.theta_drive;
-        garudaData.focOmega    = s_foc_an.smc.OmegaFltred;
-        garudaData.focVbus     = s_foc_an.vbus;
-        garudaData.focIa       = s_foc_an.ia;
-        garudaData.focIb       = s_foc_an.ib;
-        garudaData.focThetaObs = s_foc_an.smc.Theta;
-        garudaData.focVd       = s_foc_an.vd;
-        garudaData.focVq       = s_foc_an.vq;
-        garudaData.focFluxAlpha   = s_foc_an.smc.EalphaFinal;
-        garudaData.focFluxBeta    = s_foc_an.smc.EbetaFinal;
-        garudaData.focLambdaEst   = s_foc_an.thetaError;
-        garudaData.focObsGain     = s_foc_an.smc.Kslf;
-        garudaData.focPidDInteg   = s_foc_an.pi_d.integrator;
-        garudaData.focPidQInteg   = s_foc_an.pi_q.integrator;
-        garudaData.focPidSpdInteg = s_foc_an.pi_spd.integrator;
-
-        {
-            float v_mag = sqrtf(s_foc_an.vd * s_foc_an.vd
-                              + s_foc_an.vq * s_foc_an.vq);
-            float v_max = s_foc_an.vbus * 0.57735027f;
-            garudaData.focModIndex = (v_max > 0.1f) ? (v_mag / v_max) : 0.0f;
-
-            /* Confidence-like ratio: observed BEMF magnitude vs expected */
-            float bemf_mag = sqrtf(s_foc_an.smc.EalphaFinal * s_foc_an.smc.EalphaFinal
-                                 + s_foc_an.smc.EbetaFinal  * s_foc_an.smc.EbetaFinal);
-            float omega_abs = (s_foc_an.smc.OmegaFltred >= 0)
-                            ?  s_foc_an.smc.OmegaFltred : -s_foc_an.smc.OmegaFltred;
-            float bemf_exp = AN_MOTOR_LAMBDA * omega_abs;
-            float conf = (bemf_exp > 0.01f) ? (bemf_mag / bemf_exp) : 0.0f;
-            if (conf > 1.0f) conf = 1.0f;
-            garudaData.focObsConfidence = conf;
-        }
-        garudaData.focSubState = (uint8_t)s_foc_an.mode;
-        garudaData.focOffsetIa = (uint16_t)s_foc_an.ia_offset;
-        garudaData.focOffsetIb = (uint16_t)s_foc_an.ib_offset;
-
-        /* Duty for telemetry */
-        {
-            float dmax = da_an;
-            if (db_an > dmax) dmax = db_an;
-            if (dc_an > dmax) dmax = dc_an;
-            garudaData.duty = (uint32_t)(dmax * LOOPTIME_TCY);
-        }
-    }
-#else
-    /* ── 6-step state machine ── */
+    /* â”€â”€ 6-step state machine â”€â”€ */
     /* State machine */
     switch (garudaData.state)
     {
@@ -2594,14 +1400,14 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
             break;
         case ESC_ARMED:
 #if FEATURE_OC_AUTOZERO
-            /* Bridge is off in ARMED → the bus ADC reads its true rest bias.
+            /* Bridge is off in ARMED â†’ the bus ADC reads its true rest bias.
              * Average OC_AUTOZERO_SAMPLES (~1.4ms) and latch; ALIGN starts
              * 500ms later, so calibration always completes first.
              * QUIESCENCE GATE (2026-06-10): a quick re-arm with the rotor
-             * still spinning down puts regen ripple on the bus — bench showed
+             * still spinning down puts regen ripple on the bus â€” bench showed
              * whole runs with Ibus telemetry (and OC thresholds) offset ~7A
              * from a bias latched mid-spin. Latch only if the sample window
-             * is tight; otherwise discard and retry — the rotor stops and a
+             * is tight; otherwise discard and retry â€” the rotor stops and a
              * later window passes. The previous bias holds meanwhile. */
             if (s_ocZeroCount < OC_AUTOZERO_SAMPLES)
             {
@@ -2622,7 +1428,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
                         g_ocBiasAdc =
                             (uint16_t)(s_ocZeroAcc / OC_AUTOZERO_SAMPLES);
                     else
-                        s_ocZeroCount = 0;   /* ripple — retry the window */
+                        s_ocZeroCount = 0;   /* ripple â€” retry the window */
                 }
             }
 #endif
@@ -2639,7 +1445,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
             }
             break;
 
-#endif /* FEATURE_SINE_STARTUP — close so ESC_IF_RAMP is handled regardless of sine */
+#endif /* FEATURE_SINE_STARTUP â€” close so ESC_IF_RAMP is handled regardless of sine */
 
 #if FEATURE_IF_STARTUP
         case ESC_IF_RAMP:
@@ -2689,7 +1495,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
                 {
                     if (garudaData.morph.alpha >= 256)
                     {
-                        /* Convergence complete → enter Windowed Hi-Z */
+                        /* Convergence complete â†’ enter Windowed Hi-Z */
                         garudaData.morph.alpha = 256;
                         garudaData.morph.subPhase = MORPH_WINDOWED_HIZ;
                         garudaData.morph.sectorCount = 0;
@@ -2707,9 +1513,9 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
                         /* COAST: hold duty at MIN_DUTY during MORPH sub-B (windowed
                          * Hi-Z) so the bridge applies near-zero voltage to the rotor
                          * while HWZC captures clean ZCs. Was: garudaData.duty = trap_duty
-                         * (= sineRampModPct × 16/5 clamped to RAMP_DUTY_CAP = 8%), but
+                         * (= sineRampModPct Ã— 16/5 clamped to RAMP_DUTY_CAP = 8%), but
                          * 8% Vbus (1.92V) applied to a rotor at 3k eRPM (BEMF=0.31V)
-                         * = 22A across 0.05Ω. Coasting at MIN_DUTY for sub-B (~13ms
+                         * = 22A across 0.05Î©. Coasting at MIN_DUTY for sub-B (~13ms
                          * at 3k eRPM through 4 sectors) lets the rotor stay near 3k
                          * (windage decel negligible over 13ms) while HWZC PI converges.
                          * Then CL takes over with mappedDuty slewing up from MIN_DUTY.
@@ -2722,7 +1528,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
                         if (td > RT_RAMP_DUTY_CAP) td = RT_RAMP_DUTY_CAP;
                         garudaData.duty = MIN_DUTY;
 
-                        /* Float driven at trapFloat — virtual neutral */
+                        /* Float driven at trapFloat â€” virtual neutral */
                         uint32_t trapFloat = (td + MIN_DUTY) / 2;
                         const COMMUTATION_STEP_T *s =
                             &commutationTable[garudaData.currentStep];
@@ -2773,7 +1579,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
                 bool inWindow = (garudaData.morph.tickInStep >= winOpen
                               && garudaData.morph.tickInStep < winClose);
 
-                /* At 100%, keep Hi-Z for entire step — no window-close */
+                /* At 100%, keep Hi-Z for entire step â€” no window-close */
                 if (pct >= 100)
                     inWindow = true;
 
@@ -2853,12 +1659,12 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
                 {
                     /* fix #1: detect terminal sector BEFORE touching overrides.
                      * On terminal step, go straight to MORPH_HIZ with Hi-Z
-                     * intact — no driven→Hi-Z transient on the float phase. */
+                     * intact â€” no drivenâ†’Hi-Z transient on the float phase. */
                     bool isTerminal =
                         (garudaData.morph.sectorCount + 1 >= MORPH_WINDOW_SECTORS);
 
                     COMMUTATION_AdvanceStep(&garudaData);
-                    /* AdvanceStep → ApplyStep sets float to Hi-Z via
+                    /* AdvanceStep â†’ ApplyStep sets float to Hi-Z via
                      * SetCommutationStep. On non-terminal steps: release
                      * float to driven for next window. On terminal step:
                      * KEEP Hi-Z (skip release + driven write). */
@@ -2870,7 +1676,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
                                                 garudaData.duty);
                         garudaData.morph.floatIsHiZ = false;
                     }
-                    /* else: float stays Hi-Z from AdvanceStep → ApplyStep */
+                    /* else: float stays Hi-Z from AdvanceStep â†’ ApplyStep */
 
                     garudaData.morph.tickInStep = 0;
                     garudaData.timing.forcedCountdown =
@@ -2881,7 +1687,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
 
                     BEMF_ZC_OnCommutation(&garudaData, adcIsrTick);
 
-                    /* --- Schedule complete → enter full MORPH_HIZ --- */
+                    /* --- Schedule complete â†’ enter full MORPH_HIZ --- */
                     if (garudaData.morph.sectorCount >= MORPH_WINDOW_SECTORS)
                     {
                         garudaData.morph.subPhase = MORPH_HIZ;
@@ -2907,7 +1713,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
                 BEMF_ZC_Poll(&garudaData, adcIsrTick);
 
                 /* Latch "ZC confirmed this tick" BEFORE any forced
-                 * commutation runs — immune to stepsSinceLastZc race. */
+                 * commutation runs â€” immune to stepsSinceLastZc race. */
                 bool newZcThisTick = (!wasDetected
                     && garudaData.bemf.zeroCrossDetected);
 
@@ -2922,7 +1728,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
                             - garudaData.morph.lastZcTick);
                         uint16_t mHandoff =
                             TIMER1_TO_ADC_TICKS(garudaData.rampStepPeriod);
-                        /* Clamp to [handoff, 1.5× handoff] */
+                        /* Clamp to [handoff, 1.5Ã— handoff] */
                         if (measured < mHandoff)
                             measured = mHandoff;
                         uint16_t maxMeasured = mHandoff + (mHandoff >> 1);
@@ -2941,7 +1747,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
                          * period) and NOT a half-period harmonic. CL must engage
                          * on a trustworthy angle, else it drives the wrong sector
                          * and regen-sloshes the rotor (the ~22A hand-off pulse).
-                         * Use the RAW interval (pre-clamp) so the [handoff,1.5×]
+                         * Use the RAW interval (pre-clamp) so the [handoff,1.5Ã—]
                          * clamp above can't mask a harmonic. */
                         {
                             uint16_t rawIv = (uint16_t)(adcIsrTick
@@ -2951,7 +1757,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
                                 ? (uint16_t)(rawIv - ref)
                                 : (uint16_t)(ref - rawIv);
                             /* half-period harmonic: raw interval well below the
-                             * OL hand-off period (rotor can't be 2× the OL speed) */
+                             * OL hand-off period (rotor can't be 2Ã— the OL speed) */
                             bool harmonic = (rawIv < (uint16_t)(mHandoff
                                                                 - (mHandoff >> 2)));
                             bool stable = !harmonic
@@ -2992,7 +1798,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
                     garudaData.timing.fallingZcWorks = false;
                 }
 
-                /* ZC confidence gate → exit morph */
+                /* ZC confidence gate â†’ exit morph */
                 if (garudaData.timing.goodZcCount >= MORPH_ZC_THRESHOLD
                     && garudaData.timing.risingZcWorks
                     && garudaData.timing.fallingZcWorks
@@ -3039,7 +1845,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
                 {
                     if (garudaData.timing.goodZcCount >= 3)
                     {
-                        /* Partial lock — let CL pre-sync finish.
+                        /* Partial lock â€” let CL pre-sync finish.
                          * Sync rampStepPeriod from IIR-adapted stepPeriod
                          * so CL entry re-init doesn't discard morph's
                          * speed tracking and jump back to ramp-end rate.
@@ -3066,7 +1872,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
 
 
 #if FEATURE_HW_OVERCURRENT
-                /* SW OC soft limiter — same as CL (proportional duty cut) */
+                /* SW OC soft limiter â€” same as CL (proportional duty cut) */
                 if (garudaData.ibusRaw > OC_SW_LIMIT_ADC)
                 {
                     uint16_t excess = garudaData.ibusRaw - OC_SW_LIMIT_ADC;
@@ -3083,7 +1889,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
                 HAL_PWM_SetDutyCycle(garudaData.duty);
             }
 
-            /* Absolute timeout — covers BOTH sub-phases.
+            /* Absolute timeout â€” covers BOTH sub-phases.
              * If motor stalls during CONVERGE (e.g. prop overload),
              * this is the only exit path. */
             if ((garudaData.systemTick
@@ -3119,15 +1925,15 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
              * coast-listen block can `break` and skip the rest of the case,
              * then consumed by the handoff-chop block once driving resumes.
              * Fixes the chop never arming on the coast-listen entry path
-             * (2810) — the old `prevAdcState != CL` arm was eaten by the break. */
+             * (2810) â€” the old `prevAdcState != CL` arm was eaten by the break. */
             static bool hcArmPending = false;
 #endif
             /* Throttle-zero shutdown: if pot returns to zero after being raised,
-             * gracefully stop. Don't wait for desync — at low duty the HW ZC
+             * gracefully stop. Don't wait for desync â€” at low duty the HW ZC
              * comparator can trigger on noise indefinitely, keeping the motor
              * in a stalled-but-"running" state (audible buzz).
              *
-             * hasSeenThrottle prevents false shutdown at CL entry — the arming
+             * hasSeenThrottle prevents false shutdown at CL entry â€” the arming
              * gate requires pot=0, so pot is still at zero when CL starts.
              * Only arm the shutdown after the user has raised the pot once. */
             {
@@ -3172,7 +1978,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
                     zeroThrottleCount = 0;
                 }
 #else
-                /* Throttle-zero auto-disarm disabled — motor keeps running at
+                /* Throttle-zero auto-disarm disabled â€” motor keeps running at
                  * CL_IDLE_DUTY when pot is at zero. Use GSP stop or power cycle
                  * to stop the motor. */
                 (void)hasSeenThrottle;
@@ -3257,7 +2063,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
                         garudaData.sine.active = false;
 #endif
                         /* One blind commutation from the UNKNOWN rotor angle
-                         * (AM32 does exactly this — worst case zero torque on
+                         * (AM32 does exactly this â€” worst case zero torque on
                          * the first step; the listener sorts it out). */
                         COMMUTATION_ApplyStep(&garudaData,
                             (uint8_t)((garudaData.currentStep + 1u) % 6u));
@@ -3279,8 +2085,8 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
                          * blind PLL schedule: comparator armed from the
                          * first commutation, captures gated in hwzc.c. */
                         /* rotor is parked AT the align vector = step s0's
-                         * center → applying s0 gives ~zero torque. Lead by
-                         * one step (60°) so the schedule pulls forward. */
+                         * center â†’ applying s0 gives ~zero torque. Lead by
+                         * one step (60Â°) so the schedule pulls forward. */
 #if FEATURE_SINE_STARTUP
                         garudaData.sine.active = false;
                         uint8_t s0 = STARTUP_SineGetTransitionStep(&garudaData);
@@ -3304,7 +2110,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
              * until engage. Entry-init above has already run. HWZC stays off
              * during the coast (bridge-off signals would be garbage); in
              * verify mode it re-enables via the normal crossover logic right
-             * after engage. CCW: sector math not implemented — no coast. */
+             * after engage. CCW: sector math not implemented â€” no coast. */
             if (prevAdcState != ESC_CLOSED_LOOP)
             {
 #if FEATURE_ADC_CMP_ZC
@@ -3346,7 +2152,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
 
                 if (garudaData.hwzc.goodZcCount >= RT_ZC_SYNC_THRESHOLD)
                 {
-                    /* HW ZC had good lock — seed as synced to avoid
+                    /* HW ZC had good lock â€” seed as synced to avoid
                      * pre-sync forced-commutation jerk at transition */
                     garudaData.timing.zcSynced = true;
                     garudaData.timing.goodZcCount = RT_ZC_SYNC_THRESHOLD;
@@ -3359,7 +2165,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
                 }
                 else
                 {
-                    /* HW ZC was struggling — conservative pre-sync */
+                    /* HW ZC was struggling â€” conservative pre-sync */
                     garudaData.timing.zcSynced = false;
                     garudaData.timing.forcedCountdown = swPeriod;
                 }
@@ -3384,7 +2190,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
 #if FEATURE_PRESYNC_RAMP
                     /* Feedback-gated pre-sync ramp: accelerate forced commutation
                      * only when ZC evidence is strong. Requires goodZcCount >= 3
-                     * AND risingZcWorks — not a single noisy edge. If motor is
+                     * AND risingZcWorks â€” not a single noisy edge. If motor is
                      * stale (no recent ZC), hold current speed until motor catches
                      * up and ZC resumes. Same eRPM formula as OL_RAMP. */
                     if (garudaData.timing.stepPeriod > RT_MIN_ADC_STEP_PERIOD
@@ -3503,11 +2309,11 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
                 if (!garudaData.hwzc.dbgLatchDisable
 #if FEATURE_CL_DIFF_IDLE
                     /* Differential-low drive shifts the float's PWM-ON level up
-                     * by the MIN_DUTY base — HWZC's ON-window comparator model
+                     * by the MIN_DUTY base â€” HWZC's ON-window comparator model
                      * (CMPLO from the conventional duty midpoint) is invalid
-                     * there: rising fires constantly, falling never → phantom
-                     * captures → lock collapse (bench 2026-06-10). Keep HWZC off
-                     * in diff mode; the SW valley detector (unaffected by diff —
+                     * there: rising fires constantly, falling never â†’ phantom
+                     * captures â†’ lock collapse (bench 2026-06-10). Keep HWZC off
+                     * in diff mode; the SW valley detector (unaffected by diff â€”
                      * both driven phases are grounded at the sampling point, and
                      * morph-proven at these speeds) owns ZC until the swap to
                      * conventional drive. */
@@ -3670,7 +2476,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
                         /* Reset duty to ramp level to prevent ratchet:
                          * post-sync CL_IDLE floor inflates duty, and pre-sync
                          * holds mappedDuty=garudaData.duty. Without reset,
-                         * each sync→unsync cycle pumps duty higher, driving
+                         * each syncâ†’unsync cycle pumps duty higher, driving
                          * massive current through low-R motor. */
                         garudaData.duty = RT_RAMP_DUTY_CAP;
 #endif
@@ -3687,9 +2493,9 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
 
                 /* No speed-drop fallback: once HW ZC activates, it stays
                  * active at all speeds. The ADC comparator works fine at low
-                 * eRPM (24kHz samples → plenty per step). Only miss-limit
+                 * eRPM (24kHz samples â†’ plenty per step). Only miss-limit
                  * triggers fallback (error condition). This eliminates the
-                 * HW→SW transition jerk during normal deceleration. */
+                 * HWâ†’SW transition jerk during normal deceleration. */
 
                 /* Promote zcSynced once HWZC has confirmed good ZCs.
                  * This unlocks pot-mapped duty (CL_IDLE_DUTY floor)
@@ -3697,7 +2503,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
                 if (!garudaData.timing.zcSynced
 #if FEATURE_PLL_STARTUP
                     /* during the PLL blind ramp, sync is declared ONLY by
-                     * HWZC_PllStartTick's gated-capture handover — raw
+                     * HWZC_PllStartTick's gated-capture handover â€” raw
                      * goodZcCount here counts low-speed phantoms */
                     && !garudaData.hwzc.pllStartActive
 #endif
@@ -3745,7 +2551,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
                  * known period but no real BEMF edges arrive). The standard
                  * BEMF_ZC_CheckTimeout doesn't see this because lastCommTick
                  * is updated by the autonomous timer's HWZC_OnCommutation
-                 * call. Force DESYNC → RECOVERY here so the pot-zero idle
+                 * call. Force DESYNC â†’ RECOVERY here so the pot-zero idle
                  * path can recover via the regular restart cycle. */
                 {
                     static uint32_t lastZcCount = 0;
@@ -3832,7 +2638,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
                 {
                     /* Pre-sync: hold duty at CL entry level.
                      * Don't let pot changes affect duty while forced
-                     * commutation is trying to lock ZC — changing duty
+                     * commutation is trying to lock ZC â€” changing duty
                      * shifts the threshold and confuses detection. */
                     mappedDuty = garudaData.duty;
 #if FEATURE_DUTY_SLEW
@@ -3848,10 +2654,10 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
 #if FEATURE_SPEED_PI
                     /* Speed PI: throttle controls TARGET SPEED via target
                      * stepPeriodHR; PI regulates duty to track. Replaces
-                     * the direct throttle→duty scaling below. The output
+                     * the direct throttleâ†’duty scaling below. The output
                      * is updated per HWZC event (see SPEED_PI_OnZcEvent).
                      *
-                     * SPEED_PI_Enable on first sync tick — bumpless transfer
+                     * SPEED_PI_Enable on first sync tick â€” bumpless transfer
                      * (integrator seeded from garudaData.duty). */
                     if (!garudaData.speedPi.enabled)
                         SPEED_PI_Enable(&garudaData);
@@ -3859,7 +2665,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
 #else
 #if FEATURE_CL_DIFF_IDLE
                     /* Differential-low idle: throttle maps from the (sub-
-                     * MIN_DUTY) diff floor — idle equilibrium ~3k, meeting the
+                     * MIN_DUTY) diff floor â€” idle equilibrium ~3k, meeting the
                      * morph hand-off speed instead of slamming up to ~10k. */
                     mappedDuty = CL_DIFF_IDLE_FLOOR +
                         ((uint32_t)garudaData.throttle * (cap - CL_DIFF_IDLE_FLOOR)) / 4096;
@@ -3872,7 +2678,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
 #if FEATURE_CL_DIFF_IDLE
                 if (mappedDuty < CL_DIFF_IDLE_FLOOR) mappedDuty = CL_DIFF_IDLE_FLOOR;
 #elif FEATURE_CL_LOW_IDLE
-                /* Lower CL idle floor (deadtime unchanged → no shoot-through risk;
+                /* Lower CL idle floor (deadtime unchanged â†’ no shoot-through risk;
                  * only shortens the H-pulse). Drops idle equilibrium + handoff gap. */
                 if (mappedDuty < CL_LOW_IDLE_FLOOR) mappedDuty = CL_LOW_IDLE_FLOOR;
 #else
@@ -3932,7 +2738,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
                     else if (delta < 0)
                     {
 #if FEATURE_VBUS_REGEN_BRAKE
-                        /* Vbus-aware regen brake — sticky version. Once engaged
+                        /* Vbus-aware regen brake â€” sticky version. Once engaged
                          * (Vbus rose above ON threshold during a regen event),
                          * stays engaged for minimum hold ticks even if Vbus
                          * briefly dips, then releases only when Vbus falls all
@@ -3967,7 +2773,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
                         /* Proactive: at high eRPM, slew-down is limited
                          * regardless of Vbus state. Prevents the regen
                          * pulse before it spikes the bus. Reads HWZC's
-                         * stepPeriodHR — at high RPM HWZC owns the period.
+                         * stepPeriodHR â€” at high RPM HWZC owns the period.
                          * Below the threshold or before HWZC engages,
                          * no penalty applied. */
                         if (garudaData.hwzc.enabled
@@ -3985,7 +2791,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
                         /* Emergency tier: above regen brake (28V), if
                          * Vbus hits 30V, FREEZE slew-down entirely so
                          * the rotor stops dumping regen energy into bus.
-                         * Sticky hysteresis (30→27V) + 20ms min hold
+                         * Sticky hysteresis (30â†’27V) + 20ms min hold
                          * to prevent chatter. Releases when Vbus settles
                          * back below 27V AND min-hold has elapsed. */
                         static bool emergencyHoldActive = false;
@@ -4086,7 +2892,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
 #endif
 
 #if FEATURE_HW_OVERCURRENT
-                /* Software bus current soft limiter — proportional duty reduction.
+                /* Software bus current soft limiter â€” proportional duty reduction.
                  * Ramps down duty smoothly BEFORE CMP3/CLPCI hardware trips. */
                 if (garudaData.ibusRaw > OC_SW_LIMIT_ADC
                     && mappedDuty > MIN_DUTY)   /* guard: below MIN_DUTY (diff idle)
@@ -4105,7 +2911,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
 #endif
 
 #if FEATURE_CL_SOFT_ENTRY
-                /* Option A — soft OL->CL hand-off. MORPH leaves the duty already
+                /* Option A â€” soft OL->CL hand-off. MORPH leaves the duty already
                  * at operating level (~6%), so a slew-RATE limiter has no upward
                  * step to catch. Instead OWN an explicit cap that starts at
                  * MIN_DUTY on CL entry and ramps up gently, so the motor walks
@@ -4131,7 +2937,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
                 }
 #endif
 #if FEATURE_IF_BRIDGE
-                /* Option D — I-f current-limited OL->CL hand-off bridge.
+                /* Option D â€” I-f current-limited OL->CL hand-off bridge.
                  * Ramp duty up from MIN_DUTY, but back off whenever bus current
                  * exceeds the cap, so the motor accelerates from the (low-BEMF)
                  * hand-off speed to the idle equilibrium at BOUNDED current
@@ -4157,8 +2963,8 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
                          * unlocked hand-off, which a signed compare would miss.
                          * ibusRaw is sampled at the PWM valley (~0 there), so the real
                          * hand-off current registers only as a RECURRING spike that a
-                         * single per-tick read mostly misses — PEAK-HOLD it (decaying)
-                         * so the back-off actually sees the −22A and reacts. */
+                         * single per-tick read mostly misses â€” PEAK-HOLD it (decaying)
+                         * so the back-off actually sees the âˆ’22A and reacts. */
                         int32_t iInst = (int32_t)garudaData.ibusRaw
                                       - (int32_t)OC_BIAS_COUNTS;
                         if (iInst < 0) iInst = -iInst;
@@ -4168,17 +2974,17 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
                             ifPeak -= (ifPeak >> IF_BRIDGE_PEAK_DECAY_SHIFT);
                         int32_t iMag = (int32_t)ifPeak;
                         if (iMag > IF_BRIDGE_LIMIT_DELTA) {
-                            /* over the current cap — back off fast */
+                            /* over the current cap â€” back off fast */
                             if (ifDuty > MIN_DUTY + IF_BRIDGE_DOWN_RATE)
                                 ifDuty -= IF_BRIDGE_DOWN_RATE;
                             else
                                 ifDuty = MIN_DUTY;
                         } else {
-                            /* under the cap — ramp up toward normal demand */
+                            /* under the cap â€” ramp up toward normal demand */
                             ifDuty += IF_BRIDGE_UP_RATE;
                         }
                         /* Never exceed the normal demand, but DON'T exit just
-                         * because the ramp caught up — a single PWM-gated low
+                         * because the ramp caught up â€” a single PWM-gated low
                          * current sample must not let the bridge bail before the
                          * real overcurrent develops. Stay active for the whole
                          * window; once the motor reaches idle, ifDuty simply sits
@@ -4196,10 +3002,10 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
                 /* Entry glide: ramp effective duty linearly from the matched
                  * engage level to MIN_DUTY (~320ms), overriding the mapping
                  * (placed LAST so the MIN_DUTY floors above can't undo the
-                 * sub-MIN cap). Speed follows quasi-statically → near-linear
+                 * sub-MIN cap). Speed follows quasi-statically â†’ near-linear
                  * climb to the MIN_DUTY equilibrium at a few amps instead of
                  * the ballistic 22A slam. At MIN_DUTY, force-swap to the
-                 * conventional waveform — bit-identical baseline after. */
+                 * conventional waveform â€” bit-identical baseline after. */
                 if (s_glideActive)
                 {
                     if (++s_glideDivCtr >= CL_GLIDE_DIV)
@@ -4228,17 +3034,17 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
 
 #if FEATURE_CL_DIFF_IDLE
                 /* Drive-mode management. garudaData.duty is EFFECTIVE duty in
-                 * both modes (identical line-line volts for duty ≥ MIN_DUTY),
+                 * both modes (identical line-line volts for duty â‰¥ MIN_DUTY),
                  * so the swaps are voltage-seamless; only the low phase's
                  * waveform class changes. Hysteresis prevents IOCON churn. */
                 {
                     /* (CL entry is handled by the coast-listen block at the
-                     * top of the case — it engages diff mode synced.) */
+                     * top of the case â€” it engages diff mode synced.) */
                     if (g_pwmDiffLow
                              && garudaData.duty >= MIN_DUTY
                                 + (MIN_DUTY / CL_DIFF_EXIT_HYST_DIV))
                     {
-                        /* throttle demand exceeds the conventional floor —
+                        /* throttle demand exceeds the conventional floor â€”
                          * swap to the proven override-LOW waveform (HWZC
                          * re-enables via the normal crossover logic) */
                         g_pwmDiffLow = 0;
@@ -4246,7 +3052,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
                     }
                     else if (!g_pwmDiffLow && garudaData.duty < MIN_DUTY)
                     {
-                        /* demand back below the conventional floor — re-enter */
+                        /* demand back below the conventional floor â€” re-enter */
                         g_pwmDiffLow = 1;
                         HAL_PWM_SetCommutationStep(garudaData.currentStep);
 #if FEATURE_ADC_CMP_ZC
@@ -4267,7 +3073,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
                 /* Sub-MIN_DUTY current bound via the CMP3 HARDWARE chop, not duty.
                  * Hold a LOW chop threshold for a window at CL entry so the
                  * cycle-by-cycle CLPCI truncates each pulse at OC_CMP3_HANDOFF_MA
-                 * — bounding the phase current (and its −freewheel bus pulse)
+                 * â€” bounding the phase current (and its âˆ’freewheel bus pulse)
                  * regardless of duty/MIN_DUTY, with no regen oscillation. Other
                  * state transitions also write the CMP3 DAC (zcSync etc.), so we
                  * RE-ASSERT every tick to own the threshold for the whole window,
@@ -4294,7 +3100,7 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
             HAL_PWM_SetDutyCycle(garudaData.duty);
             break;
         }
-#else  /* !FEATURE_BEMF_CLOSED_LOOP — Phase 1 open-loop path */
+#else  /* !FEATURE_BEMF_CLOSED_LOOP â€” Phase 1 open-loop path */
         case ESC_CLOSED_LOOP:
             HAL_PWM_SetDutyCycle(garudaData.duty);
             break;
@@ -4304,19 +3110,18 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
             break;
 
         case ESC_RECOVERY:
-            /* PWM already disabled on entry — coast-down handled in Timer1 */
+            /* PWM already disabled on entry â€” coast-down handled in Timer1 */
             break;
 
         case ESC_FAULT:
             HAL_MC1PWMDisableOutputs();
             break;
     }
-#endif /* !FEATURE_FOC && !FEATURE_FOC_V2 && !FEATURE_FOC_V3 && !FEATURE_FOC_AN1078 — end of 6-step state machine */
 
 #if FEATURE_BEMF_CLOSED_LOOP
     /* Track state for transition detection (must be last before flag clear).
      * Use entryState (not garudaData.state) so mid-ISR state changes
-     * (e.g. morph→CL) are visible on the NEXT tick. */
+     * (e.g. morphâ†’CL) are visible on the NEXT tick. */
 #if FEATURE_SPEED_PI
     /* Disable speed PI when leaving CL state. Cleanup so SPEED_PI_OnZcEvent
      * (called from HWZC ISR) no-ops until next CL re-entry. Bumpless on
@@ -4339,13 +3144,13 @@ void __attribute__((__interrupt__, no_auto_psv)) GARUDA_ADC_INTERRUPT(void)
 }
 
 /**
- * @brief Timer1 ISR — 100us tick.
+ * @brief Timer1 ISR â€” 100us tick.
  * Handles: heartbeat LED, board service, commutation timing for
  * align/ramp states, 1ms system tick.
  */
 void __attribute__((__interrupt__, no_auto_psv)) _T1Interrupt(void)
 {
-    /* Heartbeat LED — toggle at ~2Hz (250ms) */
+    /* Heartbeat LED â€” toggle at ~2Hz (250ms) */
     heartbeatCounter++;
     if (heartbeatCounter >= HEART_BEAT_LED_COUNT)
     {
@@ -4371,15 +3176,10 @@ void __attribute__((__interrupt__, no_auto_psv)) _T1Interrupt(void)
     switch (garudaData.state)
     {
         case ESC_IDLE:
-            /* Nothing — waiting for button press in main loop */
+            /* Nothing â€” waiting for button press in main loop */
             break;
 
         case ESC_ARMED:
-#if FEATURE_FOC || FEATURE_FOC_V2 || FEATURE_FOC_V3 || FEATURE_FOC_AN1078
-            /* FOC: arming handled in ADC ISR slow loop (1kHz) to avoid
-             * cross-ISR races. Timer1 is a no-op for ESC_ARMED with FOC. */
-            break;
-#else
 #if FEATURE_ARM_BEEP
             /* Arm melody: plays AFTER the quiet arm window (OC auto-zero has
              * already latched its bias) and BEFORE startup. Three sequential
@@ -4420,17 +3220,17 @@ void __attribute__((__interrupt__, no_auto_psv)) _T1Interrupt(void)
                 if (garudaData.armCounter >= ARM_TIME_COUNTS)
 #endif
                 {
-                    /* Armed successfully — transition to ALIGN.
+                    /* Armed successfully â€” transition to ALIGN.
                      * Init before state change: ADC ISR (prio 6) can
                      * preempt Timer1 (prio 5) between the two lines. */
                     STARTUP_Init(&garudaData);
 #if FEATURE_IBUS_PROBE
                     /* Bus-current chop probe: keep the sine align ACTIVE (the
-                     * proven bridge drive — STARTUP_Init already set sine.active
+                     * proven bridge drive â€” STARTUP_Init already set sine.active
                      * + released overrides). Hold it in ESC_ALIGN (don't advance)
                      * and sweep the CMP3 chop threshold there. The earlier
                      * SetCommutationStep path never energized the bridge from
-                     * this entry → zero current; the sine drive does. */
+                     * this entry â†’ zero current; the sine drive does. */
                     garudaData.state = ESC_ALIGN;
 #elif FEATURE_AM32_STARTUP
                     /* AM32-style: no align, no ramp. Seed the listener's
@@ -4455,7 +3255,7 @@ void __attribute__((__interrupt__, no_auto_psv)) _T1Interrupt(void)
                      * STARTUP_Init's SineInit briefly wrote sine duties + released
                      * overrides; IF_StartupInit (same tick) overwrites to balanced
                      * 0V before any sine duty latches, so the sine HOLD never runs
-                     * and there's no sine→SVPWM handover. */
+                     * and there's no sineâ†’SVPWM handover. */
                     IF_StartupInit();
                     garudaData.state = ESC_IF_RAMP;
 #else
@@ -4469,7 +3269,6 @@ void __attribute__((__interrupt__, no_auto_psv)) _T1Interrupt(void)
                 garudaData.armCounter = 0; /* Reset if throttle not zero */
             }
             break;
-#endif
 
         case ESC_ALIGN:
 #if FEATURE_IBUS_PROBE
@@ -4477,8 +3276,8 @@ void __attribute__((__interrupt__, no_auto_psv)) _T1Interrupt(void)
              * bridge keeps driving real current ~1.5A), and sweep the CMP3 chop
              * threshold over a FINE 0..3A range (the align current is small).
              * As the pot rises the threshold drops; when it crosses the real
-             * current the chop fires → eRPM (trip-rate, hijacked) JUMPS and Ibus
-             * DROPS toward the threshold. Trip current: A ≈ 3 × (4095 − thr)/4095.
+             * current the chop fires â†’ eRPM (trip-rate, hijacked) JUMPS and Ibus
+             * DROPS toward the threshold. Trip current: A â‰ˆ 3 Ã— (4095 âˆ’ thr)/4095.
              * eRPM lighting + Ibus falling = the hardware current chop WORKS. */
             (void)STARTUP_SineAlign(&garudaData);
             PG1LEBbits.LEB = 80u;
@@ -4490,7 +3289,7 @@ void __attribute__((__interrupt__, no_auto_psv)) _T1Interrupt(void)
              *   pot 20-40%  INPSEL=1  CMP_B = RB5 = OA3IN+
              *   pot 40-60%  INPSEL=2  CMP_C = RA6 = OA3IN-
              *   pot 60-80%  INPSEL=3  CMP_D = RA1            (AN957's value)
-             *   pot 80-100% INPSEL=4  Bandgap 0.8V — CHAIN SELF-TEST: this MUST
+             *   pot 80-100% INPSEL=4  Bandgap 0.8V â€” CHAIN SELF-TEST: this MUST
              *               read 10000 (993 > 30). If even THIS stays 0, the
              *               comparator/DAC/CMPSTAT chain is broken, not the input. */
             {
@@ -4501,17 +3300,14 @@ void __attribute__((__interrupt__, no_auto_psv)) _T1Interrupt(void)
                 DAC3DATbits.DACDAT = 30u;
             }
             break;
-#elif FEATURE_FOC || FEATURE_FOC_V2 || FEATURE_FOC_V3 || FEATURE_FOC_AN1078
-            /* FOC: alignment handled in ADC ISR. Timer1 is a no-op. */
-            break;
 #elif FEATURE_SINE_STARTUP
-            /* I-f path bypasses ALIGN entirely (ARMED→IF_RAMP), so this only
+            /* I-f path bypasses ALIGN entirely (ARMEDâ†’IF_RAMP), so this only
              * runs in the non-IF build. */
             if (STARTUP_SineAlign(&garudaData))
             {
 #if FEATURE_PLL_STARTUP
                 /* PLL-from-align: no OL ramp, no morph. Seed the slow
-                 * initial period, flag the blind schedule, and enter CL —
+                 * initial period, flag the blind schedule, and enter CL â€”
                  * the ADC-ISR entry block engages 6-step + HWZC there. */
                 garudaData.rampStepPeriod =
                     (uint16_t)ERPM_TO_STEP_TICKS(PLL_START_ERPM0);
@@ -4532,7 +3328,7 @@ void __attribute__((__interrupt__, no_auto_psv)) _T1Interrupt(void)
             {
 #if FEATURE_PLL_STARTUP
                 /* PLL-from-align over the CLASSIC align: same exit as the
-                 * sine-align path — seed slow period, flag the blind
+                 * sine-align path â€” seed slow period, flag the blind
                  * schedule, enter CL (ADC-ISR entry block engages). */
                 garudaData.rampStepPeriod =
                     (uint16_t)ERPM_TO_STEP_TICKS(PLL_START_ERPM0);
@@ -4558,16 +3354,13 @@ void __attribute__((__interrupt__, no_auto_psv)) _T1Interrupt(void)
 #endif
 
         case ESC_OL_RAMP:
-#if FEATURE_FOC || FEATURE_FOC_V2 || FEATURE_FOC_V3 || FEATURE_FOC_AN1078
-            /* FOC: I/f ramp handled in ADC ISR. Timer1 is a no-op. */
-            break;
-#elif DIAGNOSTIC_MANUAL_STEP
+#if DIAGNOSTIC_MANUAL_STEP
             garudaData.state = ESC_CLOSED_LOOP;
             break;
 #elif FEATURE_SINE_STARTUP
             if (STARTUP_SineRamp(&garudaData))
             {
-                /* Sine ramp complete → enter waveform morph.
+                /* Sine ramp complete â†’ enter waveform morph.
                  * rampStepPeriod synced from sine eRPM in MorphInit. */
                 STARTUP_MorphInit(&garudaData);
 #if FEATURE_HW_OVERCURRENT
@@ -4581,11 +3374,11 @@ void __attribute__((__interrupt__, no_auto_psv)) _T1Interrupt(void)
                 if (garudaData.direction == 0)
                 {
                     /* Skip the morph: the CL-entry coast-listen measures the
-                     * TRUE sector/period from clean coast BEMF — no trap
+                     * TRUE sector/period from clean coast BEMF â€” no trap
                      * converge, no windowed-Hi-Z grind (deletes the morph
                      * current kick). MorphInit above already did the critical
                      * rampStepPeriod sync; the morph fields it set go unused.
-                     * Next ADC tick: normal CL entry init (prev==OL_RAMP →
+                     * Next ADC tick: normal CL entry init (prev==OL_RAMP â†’
                      * BEMF_ZC_Init path), then CL_CoastBegin cuts the bridge. */
                     garudaData.sine.active = false;
                     garudaData.state = ESC_CLOSED_LOOP;
@@ -4612,22 +3405,15 @@ void __attribute__((__interrupt__, no_auto_psv)) _T1Interrupt(void)
 #endif
 
         case ESC_MORPH:
-#if FEATURE_FOC || FEATURE_FOC_V2 || FEATURE_FOC_V3 || FEATURE_FOC_AN1078
-            /* FOC: no morph phase. Unreachable. */
-            break;
-#elif FEATURE_SINE_STARTUP
+#if FEATURE_SINE_STARTUP
             /* All morph logic runs in ADC ISR (24kHz). Timer1 is idle. */
             break;
 #else
-            /* Morph only used with SINE_STARTUP — unreachable here */
+            /* Morph only used with SINE_STARTUP â€” unreachable here */
             break;
 #endif
 
-#if FEATURE_FOC || FEATURE_FOC_V2 || FEATURE_FOC_V3 || FEATURE_FOC_AN1078
-        case ESC_CLOSED_LOOP:
-            /* FOC: all control in ADC ISR. Timer1 does nothing. */
-            break;
-#elif DIAGNOSTIC_MANUAL_STEP
+#if DIAGNOSTIC_MANUAL_STEP
         case ESC_CLOSED_LOOP:
             /* Manual step mode: hold current step. SW2 advances from main loop. */
             break;
@@ -4665,7 +3451,7 @@ void __attribute__((__interrupt__, no_auto_psv)) _T1Interrupt(void)
                 bool restartGateThrottle =
                     (garudaData.throttle >= ARM_THROTTLE_ZERO_ADC);
 #else
-                /* Throttle-zero auto-disarm disabled — recovery always
+                /* Throttle-zero auto-disarm disabled â€” recovery always
                  * attempts restart while runCommandActive is still set,
                  * regardless of throttle level. Pot-at-zero is treated as
                  * "run at idle duty", not "stop". */
@@ -4693,7 +3479,7 @@ void __attribute__((__interrupt__, no_auto_psv)) _T1Interrupt(void)
 #if FEATURE_THROTTLE_ZERO_AUTO_DISARM
                 else if (garudaData.throttle < ARM_THROTTLE_ZERO_ADC)
                 {
-                    /* Throttle is zero — user wants motor stopped.
+                    /* Throttle is zero â€” user wants motor stopped.
                      * Don't restart, go to IDLE. */
                     garudaData.runCommandActive = false;
                     garudaData.desyncRestartAttempts = 0;
@@ -4703,14 +3489,14 @@ void __attribute__((__interrupt__, no_auto_psv)) _T1Interrupt(void)
 #endif
                 else if (!garudaData.runCommandActive)
                 {
-                    /* User pressed stop during coast — graceful idle */
+                    /* User pressed stop during coast â€” graceful idle */
                     garudaData.desyncRestartAttempts = 0;
                     garudaData.state = ESC_IDLE;
                     LED2 = 0;
                 }
                 else
                 {
-                    /* Max restarts exhausted — permanent fault */
+                    /* Max restarts exhausted â€” permanent fault */
                     garudaData.runCommandActive = false;
                     garudaData.state = ESC_FAULT;
                     garudaData.faultCode = FAULT_DESYNC;
@@ -4729,15 +3515,15 @@ void __attribute__((__interrupt__, no_auto_psv)) _T1Interrupt(void)
 
 #ifdef ENABLE_PWM_FAULT_PCI
 /**
- * @brief PWM Fault ISR — handles PCI fault events.
+ * @brief PWM Fault ISR â€” handles PCI fault events.
  */
 void __attribute__((__interrupt__, no_auto_psv)) _PWMInterrupt(void)
 {
     if (PCI_FAULT_ACTIVE_STATUS)
     {
         /* Board-level FPCI fault via PCI8R (RP28/DIM040).
-         * Source: U25A (overvoltage) + U25B (overcurrent) → U27 AND gate.
-         * This is a combined OC+OV signal — cannot distinguish which triggered. */
+         * Source: U25A (overvoltage) + U25B (overcurrent) â†’ U27 AND gate.
+         * This is a combined OC+OV signal â€” cannot distinguish which triggered. */
 #if FEATURE_ADC_CMP_ZC
         if (garudaData.hwzc.enabled)
             HWZC_Disable(&garudaData);
@@ -4763,7 +3549,7 @@ void __attribute__((__interrupt__, no_auto_psv)) _PWMInterrupt(void)
 #if GARUDA_TARGET_AK512
 /**
  * @brief MC510: one comparator ISR per dedicated BEMF channel.
- * VA = AD1CH1 → AD1CMP1, VB = AD1CH2 → AD1CMP2, VC = AD2CH2 → AD2CMP2.
+ * VA = AD1CH1 â†’ AD1CMP1, VB = AD1CH2 â†’ AD1CMP2, VC = AD2CH2 â†’ AD2CMP2.
  * Same stub semantics as the 106 pair: disable own IE, clear own CMPSTAT
  * flag, dispatch HWZC_OnZcDetected (Rule 10: no data re-read here).
  */
@@ -4795,7 +3581,7 @@ void __attribute__((__interrupt__, no_auto_psv)) _AD2CMP2Interrupt(void)
 }
 #else
 /**
- * @brief ADC1 Comparator CH5 ISR — ZC detected on Phase B.
+ * @brief ADC1 Comparator CH5 ISR â€” ZC detected on Phase B.
  * Do NOT re-read AD1CH5DATA for validation (Rule 10).
  */
 void __attribute__((__interrupt__, no_auto_psv)) _AD1CMP5Interrupt(void)
@@ -4808,7 +3594,7 @@ void __attribute__((__interrupt__, no_auto_psv)) _AD1CMP5Interrupt(void)
 }
 
 /**
- * @brief ADC2 Comparator CH1 ISR — ZC detected on Phase A or C.
+ * @brief ADC2 Comparator CH1 ISR â€” ZC detected on Phase A or C.
  */
 void __attribute__((__interrupt__, no_auto_psv)) _AD2CMP1Interrupt(void)
 {
@@ -4821,7 +3607,7 @@ void __attribute__((__interrupt__, no_auto_psv)) _AD2CMP1Interrupt(void)
 #endif /* GARUDA_TARGET_AK512 */
 
 /**
- * @brief SCCP1 Timer ISR — blanking expired, commutation deadline, or timeout.
+ * @brief SCCP1 Timer ISR â€” blanking expired, commutation deadline, or timeout.
  * Action determined by hwzc.phase (Rule 3: phase is set BEFORE timer starts).
  */
 void __attribute__((__interrupt__, no_auto_psv)) _CCT1Interrupt(void)
@@ -4829,7 +3615,7 @@ void __attribute__((__interrupt__, no_auto_psv)) _CCT1Interrupt(void)
     if (!garudaData.hwzc.enabled)
     {
         /* HWZC was disabled (fault, button stop, throttle-zero shutdown)
-         * while a timer event was pending. Discard — do not commutate. */
+         * while a timer event was pending. Discard â€” do not commutate. */
         _CCT1IF = 0;
         return;
     }

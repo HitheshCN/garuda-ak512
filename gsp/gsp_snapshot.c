@@ -135,51 +135,6 @@ void GSP_CaptureSnapshot(GSP_SNAPSHOT_T *dst)
     dst->systemTick = src->systemTick;
     dst->uptimeSec  = src->systemTick / 1000;
 
-    /* FOC telemetry (float fields: may tear, acceptable for telemetry) */
-#if FEATURE_FOC_V2 || FEATURE_FOC_V3 || FEATURE_FOC_AN1078
-    dst->focIdMeas   = src->focIdMeas;
-    dst->focIqMeas   = src->focIqMeas;
-    dst->focTheta    = src->focTheta;
-    dst->focOmega    = src->focOmega;
-    dst->focVbus     = src->focVbus;
-    dst->focIa       = src->focIa;
-    dst->focIb       = src->focIb;
-    dst->focThetaObs = src->focThetaObs;
-    dst->focVd       = src->focVd;
-    dst->focVq       = src->focVq;
-    dst->focFluxAlpha   = src->focFluxAlpha;
-    dst->focFluxBeta    = src->focFluxBeta;
-    dst->focLambdaEst   = src->focLambdaEst;
-    dst->focObsGain     = src->focObsGain;
-    dst->focPidDInteg   = src->focPidDInteg;
-    dst->focPidQInteg   = src->focPidQInteg;
-    dst->focPidSpdInteg = src->focPidSpdInteg;
-    dst->focModIndex    = src->focModIndex;
-    dst->focObsConfidence = src->focObsConfidence;
-    dst->focSubState = src->focSubState;
-    dst->focOffsetIa = src->focOffsetIa;
-    dst->focOffsetIb = src->focOffsetIb;
-  #if FEATURE_FOC_V3
-    /* v3-only: SMO + PLL observer fields — GARUDA_DATA_T doesn't include
-     * these under v2 (which uses MXLEMMING flux observer instead). */
-    dst->smoResidual    = src->smoResidual;
-    dst->pllInnovation  = src->pllInnovation;
-    dst->pllOmega       = src->pllOmega;
-    dst->omegaOl        = src->omegaOl;
-    dst->handoffCtr     = src->handoffCtr;
-    dst->smoObservable  = src->smoObservable;
-  #endif
-#elif FEATURE_FOC
-    dst->focTheta    = src->focTheta;
-    dst->focOmega    = src->focOmega;
-    dst->focVbus     = src->focVbus;
-    dst->focIa       = src->focIa;
-    dst->focIb       = src->focIb;
-    dst->focSubState = src->focSubState;
-    dst->focOffsetIa = src->focOffsetIa;
-    dst->focOffsetIb = src->focOffsetIb;
-#endif
-
     /* Prio-7 fields: use consistency techniques */
 #if FEATURE_ADC_CMP_ZC
     /* stepPeriodHR: seqlock */
@@ -222,7 +177,6 @@ void GSP_CaptureSnapshot(GSP_SNAPSHOT_T *dst)
     src->bemf.fallOffBemfMin = 0xFFFF;
     src->bemf.fallOffBemfMax = 0;
 
-#if !FEATURE_FOC && !FEATURE_FOC_V2 && !FEATURE_FOC_V3 && !FEATURE_FOC_AN1078
     /* Phase-current monitor (16-bit fields are atomic on dsPIC33AK).
      * Read the window max/min, then reset them in one block so the ADC ISR
      * starts a fresh window. Small race here: if the ADC ISR fires between
@@ -252,7 +206,6 @@ void GSP_CaptureSnapshot(GSP_SNAPSHOT_T *dst)
     dst->ibusAtFault    = src->phaseCurrent.ibusAtFault;
     dst->ibusMaxAtFault = src->phaseCurrent.ibusMaxAtFault;
     dst->ibusMinAtFault = src->phaseCurrent.ibusMinAtFault;
-#endif
 
     /* Speed PI telemetry (zero unless FEATURE_SPEED_PI=1; the struct
      * fields exist either way, sourced from GARUDA_DATA_T.speedPi). */
